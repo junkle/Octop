@@ -913,7 +913,16 @@ export default function RemoteBrowserPage({
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
         sendEvent({ type: "type", text: e.key });
       } else {
-        sendEvent({ type: "keydown", key: e.key });
+        sendEvent({
+          type: "keydown",
+          key: e.key,
+          code: e.code,
+          modifiers:
+            (e.altKey ? 1 : 0) |
+            (e.ctrlKey ? 2 : 0) |
+            (e.metaKey ? 4 : 0) |
+            (e.shiftKey ? 8 : 0),
+        });
       }
     },
     [sendEvent],

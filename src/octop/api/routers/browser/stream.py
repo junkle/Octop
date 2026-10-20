@@ -176,6 +176,22 @@ async def _listen_state_loop(
 
 
 _CDP_BUTTON_MASK = {"left": 1, "right": 2, "middle": 4, "none": 0}
+_CDP_VIRTUAL_KEY_CODES = {
+    "Backspace": 8,
+    "Tab": 9,
+    "Enter": 13,
+    "Escape": 27,
+    "Home": 36,
+    "End": 35,
+    "PageUp": 33,
+    "PageDown": 34,
+    "ArrowLeft": 37,
+    "ArrowUp": 38,
+    "ArrowRight": 39,
+    "ArrowDown": 40,
+    "Insert": 45,
+    "Delete": 46,
+}
 
 
 def _cdp_button(raw: object) -> str:
@@ -222,6 +238,56 @@ def _cdp_click_count(msg: dict[str, Any]) -> int:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return 1
+
+
+def _cdp_virtual_key_code(key: str) -> int:
+    if key in _CDP_VIRTUAL_KEY_CODES:
+        return _CDP_VIRTUAL_KEY_CODES[key]
+    if key.startswith("F") and key[1:].isdigit() and 1 <= int(key[1:]) <= 12:
+        return 111 + int(key[1:])
+    if len(key) == 1:
+        if key.isalpha():
+            return ord(key.upper())
+        if key.isdigit():
+            return ord(key)
+    return 0
+
+
+def _cdp_modifiers(msg: dict[str, Any]) -> int:
+    raw = msg.get("modifiers")
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _dispatch_key(sess: Any, msg: dict[str, Any]) -> None:
+    key = str(msg.get("key") or "")
+    if not key:
+        return
+    code = str(msg.get("code") or key)
+    virtual_key_code = _cdp_virtual_key_code(key)
+    params: dict[str, Any] = {
+        "key": key,
+        "code": code,
+        "modifiers": _cdp_modifiers(msg),
+    }
+    if virtual_key_code:
+        params["windowsVirtualKeyCode"] = virtual_key_code
+        params["nativeVirtualKeyCode"] = virtual_key_code
+    if key == "Enter":
+        params["text"] = "\r"
+
+    await sess._internal.client.send(  # noqa: SLF001
+        "Input.dispatchKeyEvent",
+        {"type": "keyDown", **params},
+    )
+    await sess._internal.client.send(  # noqa: SLF001
+        "Input.dispatchKeyEvent",
+        {"type": "keyUp", **params},
+    )
 
 
 async def _handle_client_event(sess: Any, msg: dict[str, Any]) -> None:
@@ -303,9 +369,7 @@ async def _handle_client_event(sess: Any, msg: dict[str, Any]) -> None:
         if text:
             await sess.type(text)
     elif t == "keydown":
-        key = str(msg.get("key") or "")
-        if key in ("Enter",):
-            await sess.type("\n")
+        await _dispatch_key(sess, msg)
     elif t == "tab_switch":
         tab_id = msg.get("tab_id")
         if tab_id is not None:
