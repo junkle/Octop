@@ -149,20 +149,21 @@ def validate_mcp_http_url(url: str) -> str:
     if is_private_or_local_host(host):
         return text
 
-    # Public remote MCP: HTTPS only + existing SSRF guards.
-    if parsed.scheme != "https":
-        raise OctopError(
-            ErrorCode.CONNECTOR_MCP_HTTPS_REQUIRED,
-            "public MCP server URLs must use https",
-        )
-    try:
-        validate_https_url(text, field="url")
-    except UnsafeOutboundUrl as exc:
-        raise OctopError(
-            ErrorCode.CONNECTOR_MCP_URL_INVALID,
-            str(exc),
-            details={"reason": str(exc)},
-        ) from exc
+    # All hosts: http and https are both accepted. The historical
+    # ``OCTOP_MCP_HTTP_PUBLIC_HOSTS`` env-var whitelist has been removed
+    # per ops request. HTTPS requests still go through the shared SSRF guard
+    # (literal private/reserved IPs rejected); HTTP skips it because operators
+    # deliberately use it for internal/LAN endpoints.
+    if parsed.scheme == "https":
+        try:
+            validate_https_url(text, field="url")
+        except UnsafeOutboundUrl as exc:
+            raise OctopError(
+                ErrorCode.CONNECTOR_MCP_URL_INVALID,
+                str(exc),
+                details={"reason": str(exc)},
+            ) from exc
+    # http: accept without SSRF validation.
     return text
 
 
