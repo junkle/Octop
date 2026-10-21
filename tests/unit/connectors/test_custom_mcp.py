@@ -124,8 +124,10 @@ def test_shared_custom_server_uses_collision_safe_name_for_viewer(
     assert svc.list_default_open_mcp_server_names(viewer_id) == []
 
 
-def test_rejects_public_http_and_allows_lan():
+def test_rejects_public_http_and_allows_lan(monkeypatch):
     from octop.infra.errors import ErrorCode, OctopError
+
+    monkeypatch.delenv("OCTOP_MCP_HTTP_ALLOWED_HOSTS", raising=False)
 
     with pytest.raises(OctopError) as http_exc:
         normalize_server_spec(
@@ -145,6 +147,32 @@ def test_rejects_public_http_and_allows_lan():
             {"transport": "streamable_http", "url": url},
         )
         assert spec["url"] == url
+
+
+def test_allows_configured_public_http_hosts(monkeypatch):
+    monkeypatch.setenv("OCTOP_MCP_HTTP_ALLOWED_HOSTS", "exact.example.com, *.leisai.com")
+
+    exact = normalize_server_spec(
+        "exact",
+        {"transport": "streamable_http", "url": "http://exact.example.com/mcp"},
+    )
+    wildcard = normalize_server_spec(
+        "wildcard",
+        {"transport": "streamable_http", "url": "http://finder.leisai.com:13890/mcp"},
+    )
+
+    assert exact["url"] == "http://exact.example.com/mcp"
+    assert wildcard["url"] == "http://finder.leisai.com:13890/mcp"
+
+    monkeypatch.setenv("OCTOP_MCP_HTTP_ALLOWED_HOSTS", "*.leisai.com")
+    from octop.infra.errors import ErrorCode, OctopError
+
+    with pytest.raises(OctopError) as exc:
+        normalize_server_spec(
+            "other",
+            {"transport": "streamable_http", "url": "http://example.com/mcp"},
+        )
+    assert exc.value.code is ErrorCode.CONNECTOR_MCP_HTTPS_REQUIRED
 
 
 def test_allows_loopback_http_and_https():

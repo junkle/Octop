@@ -185,6 +185,7 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_CAPTCHA_V3_MIN_SCORE` | float | `0.5` | Minimum `recaptcha-v3` score; admin UI is read-only |
 | `OCTOP_DEFAULT_TIMEZONE` | IANA tz | `Asia/Shanghai` | Default timezone for display, scheduling, and harness (`cron_timezone` / `OCTOP_CRON_TIMEZONE` still accepted) |
 | `OCTOP_CORS_ORIGINS` | comma-sep list | empty | Permitted CORS origins for the dashboard / external callers |
+| `OCTOP_MCP_HTTP_ALLOWED_HOSTS` | comma-sep list | empty | Hosts allowed to use HTTP for custom MCP/connector URLs. Entries may be exact hosts (`finder.example.com`) or suffixes (`*.example.com`); loopback/LAN hosts remain allowed without this setting |
 | `OCTOP_ENABLE_DASHBOARD` | bool | `true` | Serve the built React SPA at `/` |
 | `OCTOP_ENABLE_API_DOCS` | bool | `false` | Expose Scalar API docs at `/api/docs` |
 | `OCTOP_REQUIRE_SETUP_PASSWORD` | bool | `true` | Require wizard password during initial setup |

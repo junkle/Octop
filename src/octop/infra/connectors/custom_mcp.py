@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -23,6 +24,7 @@ _SECRET_KEYS = frozenset({_OAUTH_KEY})
 _HARNESS_STRIP_KEYS = _META_KEYS | _SECRET_KEYS
 _DISPLAY_NAME_MAX = 64
 _MCP_STREAMABLE_HTTP_ACCEPT = "application/json, text/event-stream"
+_MCP_HTTP_ALLOWED_HOSTS_ENV = "OCTOP_MCP_HTTP_ALLOWED_HOSTS"
 
 Transport = Literal["streamable_http", "stdio"]
 
@@ -115,13 +117,28 @@ def _normalize_args(raw: Any) -> list[str]:
     return [str(item) for item in raw]
 
 
+def _http_host_allowed(host: str) -> bool:
+    raw = os.environ.get(_MCP_HTTP_ALLOWED_HOSTS_ENV, "")
+    for entry in raw.replace(",", " ").split():
+        allowed = entry.lower().rstrip(".")
+        if allowed.startswith("*."):
+            suffix = allowed[1:]
+            if host.endswith(suffix) and len(host) > len(suffix):
+                return True
+        elif allowed.startswith("."):
+            if host.endswith(allowed) and len(host) > len(allowed):
+                return True
+        elif host == allowed:
+            return True
+    return False
+
+
 def validate_mcp_http_url(url: str) -> str:
     """Validate a user-configured MCP/connector URL.
 
     Loopback and LAN (private / link-local) hosts may use HTTP or HTTPS with no
-    SSRF restriction — operators deliberately point connectors at local MCP
-    servers. Public remote hosts must use HTTPS and pass the shared SSRF guard
-    (literal private/reserved IPs rejected).
+    SSRF restriction. Other HTTP hosts require an operator-configured allowlist;
+    HTTPS must pass the shared SSRF guard (literal private/reserved IPs rejected).
     """
     text = url.strip()
     if not text:
@@ -149,20 +166,23 @@ def validate_mcp_http_url(url: str) -> str:
     if is_private_or_local_host(host):
         return text
 
-    # Public remote MCP: HTTPS only + existing SSRF guards.
-    if parsed.scheme != "https":
+    # Operator-configured HTTP hosts are for trusted internal domains that use
+    # public DNS names (for example ``*.leisai.com``). Anything else must use
+    # HTTPS so arbitrary user-configured public HTTP targets stay blocked.
+    if parsed.scheme == "http" and not _http_host_allowed(host):
         raise OctopError(
             ErrorCode.CONNECTOR_MCP_HTTPS_REQUIRED,
             "public MCP server URLs must use https",
         )
-    try:
-        validate_https_url(text, field="url")
-    except UnsafeOutboundUrl as exc:
-        raise OctopError(
-            ErrorCode.CONNECTOR_MCP_URL_INVALID,
-            str(exc),
-            details={"reason": str(exc)},
-        ) from exc
+    if parsed.scheme == "https":
+        try:
+            validate_https_url(text, field="url")
+        except UnsafeOutboundUrl as exc:
+            raise OctopError(
+                ErrorCode.CONNECTOR_MCP_URL_INVALID,
+                str(exc),
+                details={"reason": str(exc)},
+            ) from exc
     return text
 
 
