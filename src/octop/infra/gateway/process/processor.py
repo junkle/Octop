@@ -1493,6 +1493,7 @@ class GlobalProcessor:
             auto_route=model_route.automatic,
             message_kwargs=message_kwargs or None,
             reasoning_overrides=reasoning_overrides,
+            itr_user_id=meta.get("itr_user_id"),
         )
         self.teams.stamp_host_runtime(request, agent_id)
         self._attach_turn_knowledge_config(

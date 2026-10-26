@@ -134,11 +134,18 @@ async def handle_agent_mcp_request(
         if name == "list_octop_experts":
             result = service.list_experts(user)
         elif name == "call_octop_expert":
+            # 除核心三参外，其余参数（如 ITR 声明的 itr_user_id/wecom_user_id/business_context）
+            # 作为调用方身份透传，供专家在本轮 turn 回调上游 MCP 工具时做数据权限过滤。
+            caller_meta = {
+                k: v for k, v in arguments.items()
+                if k not in {"expert_id", "message", "thread_id"} and v is not None
+            }
             result = await service.call_expert(
                 user,
                 expert_id=str(arguments.get("expert_id") or ""),
                 message=str(arguments.get("message") or ""),
                 thread_id=(str(arguments["thread_id"]) if arguments.get("thread_id") else None),
+                caller_meta=caller_meta or None,
             )
         elif name == "resume_octop_expert":
             raw_decisions = arguments.get("decisions")
