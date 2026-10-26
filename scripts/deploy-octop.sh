@@ -72,7 +72,8 @@ if [[ $SKIP_BUILD -eq 0 ]]; then
   trap cleanup_build EXIT
   { cat "$REPO_ROOT/CHANGELOG.md"; echo; cat "$REPO_ROOT/README.md"; } > "$REPO_ROOT/README.pypi.md"
   cp "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/pyproject.toml.bak"
-  uv run python -c "from pathlib import Path; p=Path('$REPO_ROOT/pyproject.toml'); p.write_text(p.read_text().replace('readme = \"README.md\"', 'readme = \"README.pypi.md\"', 1))"
+  (cd "$REPO_ROOT" && uv run python -c "from pathlib import Path; p=Path('pyproject.toml'); p.write_text(p.read_text().replace('readme = \"README.md\"', 'readme = \"README.pypi.md\"', 1))") \
+    || { cleanup_build; fail "替换 readme 字段失败"; }
   rm -rf "$DIST_DIR"/*
   (cd "$REPO_ROOT" && uv build) || { cleanup_build; fail "uv build 失败"; }
   cleanup_build; trap - EXIT
