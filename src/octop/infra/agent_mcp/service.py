@@ -61,6 +61,7 @@ class AgentMcpGatewayService:
         expert_id: str,
         message: str,
         thread_id: str | None = None,
+        caller_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         row = self._require_expert(expert_id, user)
         text = self._validate_message(message)
@@ -69,6 +70,15 @@ class AgentMcpGatewayService:
             user=user,
             thread_id=thread_id,
         )
+        meta: dict[str, Any] = {
+            "session_key": session_key,
+            "thread_id": thread,
+            "user_is_admin": user.is_admin,
+        }
+        # 外部 Agent（如 ITR）经 arguments 声明的调用方身份，随 metadata 透传，
+        # 供专家在本轮 turn 调用上游 MCP 工具时做数据权限过滤。
+        if caller_meta:
+            meta.update({k: v for k, v in caller_meta.items() if v is not None})
         inbound = InboundMessage(
             channel_id=MCP_CHANNEL_ID,
             channel_type=ThreadRegistry.CHANNEL_MCP,
@@ -76,11 +86,7 @@ class AgentMcpGatewayService:
             channel_subject=ChannelSubject(subject_id=str(user.id)),
             channel_session_id=session_key,
             content=[TextContent(text=text)],
-            metadata={
-                "session_key": session_key,
-                "thread_id": thread,
-                "user_is_admin": user.is_admin,
-            },
+            metadata=meta,
         )
         chunks = self._gateway.processor.iter_turn_chunks(inbound)
         return await self._collect_result(

@@ -305,6 +305,7 @@ def build_harness_request(
     auto_route: bool = False,
     message_kwargs: dict[str, Any] | None = None,
     reasoning_overrides: dict[str, Any] | None = None,
+    itr_user_id: str | None = None,
 ) -> dict[str, Any]:
     if messages is not None:
         req: dict[str, Any] = {
@@ -322,6 +323,8 @@ def build_harness_request(
             configurable["session_key"] = session_key
         if reasoning_overrides:
             configurable["octop_reasoning_overrides"] = reasoning_overrides
+        if itr_user_id:
+            configurable["itr_user_id"] = itr_user_id
         if configurable:
             req["configurable"] = configurable
         if model:
@@ -358,6 +361,8 @@ def build_harness_request(
         configurable["session_key"] = session_key
     if reasoning_overrides:
         configurable["octop_reasoning_overrides"] = reasoning_overrides
+    if itr_user_id:
+        configurable["itr_user_id"] = itr_user_id
     if configurable:
         req["configurable"] = configurable
     if model:
