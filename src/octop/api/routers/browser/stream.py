@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
@@ -52,7 +53,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_FRAME_INTERVAL_S = 0.25  # ~4 fps
+_FRAME_INTERVAL_S = 1 / 12
+_SESSION_INTERVAL_S = 1.0
 
 
 def _normalize_nav_url(raw: str) -> str:
@@ -145,15 +147,19 @@ async def _stream_loop(
     await send_json({"type": "status", "status": "browser_started"})
     await send_json({"type": "status", "status": "streaming"})
 
+    next_snapshot = 0.0
     while is_connected():
-        await _send_session_snapshot(send_json, profile, sess=sess)
+        started = time.monotonic()
+        if started >= next_snapshot:
+            await _send_session_snapshot(send_json, profile, sess=sess)
+            next_snapshot = started + _SESSION_INTERVAL_S
 
         if not listen_only:
             frame = await _capture_jpeg(sess)
             if frame:
                 await send_json({"type": "frame", "data": frame})
 
-        await asyncio.sleep(_FRAME_INTERVAL_S)
+        await asyncio.sleep(max(0, _FRAME_INTERVAL_S - (time.monotonic() - started)))
 
 
 async def _listen_state_loop(
@@ -172,26 +178,10 @@ async def _listen_state_loop(
     while is_connected():
         sess = await resolve_harness_session(profile, create=False)
         await _send_session_snapshot(send_json, profile, sess=sess)
-        await asyncio.sleep(_FRAME_INTERVAL_S if sess is not None else 2.0)
+        await asyncio.sleep(_SESSION_INTERVAL_S if sess is not None else 2.0)
 
 
 _CDP_BUTTON_MASK = {"left": 1, "right": 2, "middle": 4, "none": 0}
-_CDP_VIRTUAL_KEY_CODES = {
-    "Backspace": 8,
-    "Tab": 9,
-    "Enter": 13,
-    "Escape": 27,
-    "Home": 36,
-    "End": 35,
-    "PageUp": 33,
-    "PageDown": 34,
-    "ArrowLeft": 37,
-    "ArrowUp": 38,
-    "ArrowRight": 39,
-    "ArrowDown": 40,
-    "Insert": 45,
-    "Delete": 46,
-}
 
 
 def _cdp_button(raw: object) -> str:
@@ -240,53 +230,49 @@ def _cdp_click_count(msg: dict[str, Any]) -> int:
         return 1
 
 
-def _cdp_virtual_key_code(key: str) -> int:
-    if key in _CDP_VIRTUAL_KEY_CODES:
-        return _CDP_VIRTUAL_KEY_CODES[key]
-    if key.startswith("F") and key[1:].isdigit() and 1 <= int(key[1:]) <= 12:
-        return 111 + int(key[1:])
-    if len(key) == 1:
-        if key.isalpha():
-            return ord(key.upper())
-        if key.isdigit():
-            return ord(key)
-    return 0
-
-
-def _cdp_modifiers(msg: dict[str, Any]) -> int:
-    raw = msg.get("modifiers")
-    if raw is None:
-        return 0
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return 0
+_KEY_CODES = {
+    "Backspace": 8,
+    "Tab": 9,
+    "Enter": 13,
+    "Escape": 27,
+    "PageUp": 33,
+    "PageDown": 34,
+    "End": 35,
+    "Home": 36,
+    "ArrowLeft": 37,
+    "ArrowUp": 38,
+    "ArrowRight": 39,
+    "ArrowDown": 40,
+    "Delete": 46,
+}
 
 
 async def _dispatch_key(sess: Any, msg: dict[str, Any]) -> None:
     key = str(msg.get("key") or "")
-    if not key:
+    if not key or key in {"Process", "Dead", "Unidentified"}:
         return
-    code = str(msg.get("code") or key)
-    virtual_key_code = _cdp_virtual_key_code(key)
+    modifiers = sum(
+        bit
+        for field, bit in (("altKey", 1), ("ctrlKey", 2), ("metaKey", 4), ("shiftKey", 8))
+        if msg.get(field)
+    )
+    key_code = _KEY_CODES.get(key, ord(key.upper()) if len(key) == 1 and key.isascii() else 0)
     params: dict[str, Any] = {
         "key": key,
-        "code": code,
-        "modifiers": _cdp_modifiers(msg),
+        "code": str(msg.get("code") or key),
+        "windowsVirtualKeyCode": int(msg.get("keyCode") or key_code),
+        "modifiers": modifiers,
     }
-    if virtual_key_code:
-        params["windowsVirtualKeyCode"] = virtual_key_code
-        params["nativeVirtualKeyCode"] = virtual_key_code
+    down = {**params, "type": "rawKeyDown", "autoRepeat": bool(msg.get("repeat"))}
     if key == "Enter":
-        params["text"] = "\r"
-
+        down.update(type="keyDown", text="\r", unmodifiedText="\r")
+    if key.lower() == "a" and modifiers & 6 and not modifiers & 1:
+        # Chromium's native editing shortcuts depend on the server OS. Keep
+        # Ctrl+A / Cmd+A working when the dashboard and Chrome run on different OSes.
+        down["commands"] = ["selectAll"]
+    await sess._internal.client.send("Input.dispatchKeyEvent", down)  # noqa: SLF001
     await sess._internal.client.send(  # noqa: SLF001
-        "Input.dispatchKeyEvent",
-        {"type": "keyDown", **params},
-    )
-    await sess._internal.client.send(  # noqa: SLF001
-        "Input.dispatchKeyEvent",
-        {"type": "keyUp", **params},
+        "Input.dispatchKeyEvent", {**params, "type": "keyUp"}
     )
 
 
@@ -367,7 +353,9 @@ async def _handle_client_event(sess: Any, msg: dict[str, Any]) -> None:
     elif t == "type":
         text = str(msg.get("text") or "")
         if text:
-            await sess.type(text)
+            # Committed IME / pasted text is one insertion, not one CDP round
+            # trip per character. The page's input event still reaches the recorder.
+            await sess._internal.client.send("Input.insertText", {"text": text})  # noqa: SLF001
     elif t == "keydown":
         await _dispatch_key(sess, msg)
     elif t == "tab_switch":
