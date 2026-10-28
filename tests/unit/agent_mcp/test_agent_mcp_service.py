@@ -68,3 +68,36 @@ def test_merge_caller_meta_blocks_privilege_escalation() -> None:
     assert meta["thread_id"] == "t1"
     assert "role" not in meta
     assert "itr_user_id" not in meta
+
+
+def test_merge_caller_meta_allows_itr_nickname() -> None:
+    from octop.infra.agent_mcp.service import _merge_caller_meta
+
+    meta = {"user_is_admin": False}
+    _merge_caller_meta(meta, {"itr_nickname": "俊工"})
+    assert meta["itr_nickname"] == "俊工"
+
+
+def test_sse_frame_format() -> None:
+    from octop.infra.agent_mcp.stream_bridge import sse_frame
+
+    frame = sse_frame("token", {"text": "你好"})
+    assert frame.startswith("event: token\ndata: ")
+    assert frame.endswith("\n\n")
+    assert '"你好"' in frame  # ensure_ascii=False
+
+
+def test_tool_tracker_emits_start_once_and_pairs_results() -> None:
+    from octop.infra.agent_mcp.stream_bridge import _ToolTracker
+
+    tracker = _ToolTracker()
+    first = tracker.on_call_chunk({"index": 0})
+    assert first is not None
+    # 同一 index 的后续分片不再发 start
+    assert tracker.on_call_chunk({"index": 0}) is None
+    second = tracker.on_call_chunk({"index": 1})
+    assert second is not None and second != first
+    # tool_result 无 index，按 FIFO 配对
+    assert tracker.on_result() == first
+    assert tracker.on_result() == second
+    assert tracker.on_result() is None

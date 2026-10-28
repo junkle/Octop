@@ -30,7 +30,7 @@ _DECISION_TYPES = frozenset({"approve", "edit", "reject", "respond"})
 # call_octop_expert 额外参数中允许透传进 turn metadata 的调用方身份 key。
 # 保留字段（session_key/thread_id/user_is_admin）一律不允许被外部调用方覆盖。
 _CALLER_META_ALLOWED_KEYS = frozenset(
-    {"itr_user_id", "wecom_user_id", "business_context"}
+    {"itr_user_id", "itr_nickname", "wecom_user_id", "business_context"}
 )
 
 
