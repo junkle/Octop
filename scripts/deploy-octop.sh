@@ -106,11 +106,15 @@ if [[ "$TARGET" == "test" ]]; then
     || fail "uv pip install 失败"
   ssh "$HOST" "systemctl --user restart octop" || fail "服务重启失败"
 else
-  # 99: root 系统级 systemd，hjh 无 sudo，经 su -c 提权；venv 自带 pip
+  # 99: root 系统级 systemd，hjh 无 sudo，经 su -c 提权；venv 内 pip 可用
+  # 注意: venv 是 uv 建的（python 为 symlink → /root/.local/share/uv/python/...），
+  #       symlink 断裂时 pip 报 "cannot execute: required file not found"，需先修复。
   if [[ -z "$PROD_ROOT_PWD" ]]; then
     read -rsp "正式机(99) root 密码: " PROD_ROOT_PWD; echo
   fi
-  run_root() { ssh "$PROD_HOST" "echo '$PROD_ROOT_PWD' | su -c \"$1\" 2>&1 | grep -v '^Password:'"; }
+  # 用 sed 而非 grep -v 过滤 su 的密码提示符: su 的 "Password: " 无换行，
+  # 会与命令首行输出粘在同一行，grep -v 会把该行整行吞掉（空输出时 grep exit 1 → 误报失败）。
+  run_root() { ssh "$PROD_HOST" "echo '$PROD_ROOT_PWD' | su -c \"$1\" 2>&1 | sed 's/^Password: //'"; }
   REMOTE_VER_BEFORE=$(run_root "cat /root/.octop/venv/lib/python3.*/site-packages/octop-*.dist-info/METADATA 2>/dev/null | grep '^Version:' | head -1" || true)
   run_root "/root/.octop/venv/bin/pip install --no-deps --quiet $REMOTE_TMP" \
     || fail "pip install 失败"
