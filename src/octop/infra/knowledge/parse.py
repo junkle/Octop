@@ -27,6 +27,7 @@ _PLAIN_TEXT_SUFFIXES = {
 _DOCX_FALLBACK_TAG = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
 _DOCX_HTML_TYPES = {"application/xhtml+xml", "text/html"}
 _DOCX_MAIN_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_MIN_IMAGE_OCR_CHARS = 10
 
 
 def parse_document(path: Path, *, ocr: OcrExtractor | None = None) -> str:
@@ -50,11 +51,14 @@ def parse_document(path: Path, *, ocr: OcrExtractor | None = None) -> str:
         from pypdf import PdfReader
 
         text = "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
-        if text.strip() or ocr is None:
+        if ocr is None:
             return text
-        return ocr(path)
+        if not text.strip():
+            return ocr(path)
+        extra = _pdf_images_text(path, ocr)
+        return f"{text}\n{extra}" if extra else text
     if suffix == ".docx":
-        return _parse_docx(path)
+        return _with_zip_images(path, _parse_docx(path), "word/media/", ocr)
     if suffix in {".wps", ".doc"}:
         from octop.infra.utils.anydoc_convert import extract_markdown_file
 
@@ -65,17 +69,78 @@ def parse_document(path: Path, *, ocr: OcrExtractor | None = None) -> str:
     if suffix == ".pptx":
         from pptx import Presentation
 
-        return "\n".join(
+        text = "\n".join(
             shape.text
             for slide in Presentation(str(path)).slides
             for shape in slide.shapes
             if hasattr(shape, "text") and shape.text
         )
+        return _with_zip_images(path, text, "ppt/media/", ocr)
     if suffix in {".xlsx", ".xlsm"}:
-        return _parse_xlsx(path)
+        return _with_zip_images(path, _parse_xlsx(path), "xl/media/", ocr)
     if suffix == ".xls":
         return _parse_xls(path)
     raise ValueError(f"unsupported knowledge document extension: {suffix or '(none)'}")
+
+
+def _pdf_images_text(path: Path, ocr: OcrExtractor) -> str:
+    """OCR raster images embedded in a text PDF. Failures on one image are skipped."""
+    import pymupdf
+
+    pieces: list[str] = []
+    try:
+        document = pymupdf.open(path)
+    except Exception:
+        return ""
+    try:
+        for page in document:
+            for image in page.get_images(full=True):
+                try:
+                    data = document.extract_image(image[0])["image"]
+                except Exception:
+                    continue
+                text = ocr(data)
+                if len(text.strip()) >= _MIN_IMAGE_OCR_CHARS:
+                    pieces.append(text)
+    finally:
+        document.close()
+    return "\n".join(pieces)
+
+
+_ZIP_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+def _with_zip_images(path: Path, text: str, media_prefix: str, ocr: OcrExtractor | None) -> str:
+    """Keep extracted text, and append OCR of pictures packed in an Office zip."""
+    if ocr is None:
+        return text
+    extra = _zip_media_images_text(path, media_prefix, ocr)
+    if not extra:
+        return text
+    return f"{text}\n{extra}" if text.strip() else extra
+
+
+def _zip_media_images_text(path: Path, media_prefix: str, ocr: OcrExtractor) -> str:
+    import hashlib
+    import zipfile
+
+    pieces: list[str] = []
+    seen: set[bytes] = set()
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not name.startswith(media_prefix) or name.endswith("/"):
+                continue
+            if Path(name).suffix.lower() not in _ZIP_IMAGE_SUFFIXES:
+                continue
+            data = archive.read(name)
+            digest = hashlib.sha256(data).digest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            text = ocr(data)
+            if len(text.strip()) >= _MIN_IMAGE_OCR_CHARS:
+                pieces.append(text)
+    return "\n".join(pieces)
 
 
 _TEXT_ENCODINGS = ("utf-8-sig", "gb18030")
