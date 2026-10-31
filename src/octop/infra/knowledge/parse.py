@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import struct
 from collections.abc import Iterable
 from html.parser import HTMLParser
 from pathlib import Path
@@ -28,83 +30,230 @@ _DOCX_FALLBACK_TAG = "{http://schemas.openxmlformats.org/markup-compatibility/20
 _DOCX_HTML_TYPES = {"application/xhtml+xml", "text/html"}
 _DOCX_MAIN_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _MIN_IMAGE_OCR_CHARS = 10
+_MIN_CONTENT_IMAGE_PX = 80
+_VECTOR_IMAGE_EXTS = {"emf", "wmf"}
 
 
 def parse_document(path: Path, *, ocr: OcrExtractor | None = None) -> str:
     """Extract searchable text from a supported local document."""
+    return parse_document_with_assets(path, ocr=ocr)[0]
+
+
+def parse_document_with_assets(
+    path: Path, *, ocr: OcrExtractor | None = None
+) -> tuple[str, dict[str, bytes]]:
+    """Return searchable text and the unique raster images referenced from it.
+
+    PDF pages and PPTX slides keep each content image beside that page's text via
+    ``[[IMG:{id}]]``. Office zip text (docx, xlsx) stays appended, without markers.
+    A standalone image keeps its OCR text only; callers fetch it with ``self``.
+    """
     suffix = path.suffix.lower()
     if suffix in OCR_IMAGE_SUFFIXES:
         if ocr is None:
             raise RuntimeError("knowledge OCR is not enabled")
-        return ocr(path)
+        return ocr(path), {}
     if suffix in _PLAIN_TEXT_SUFFIXES:
-        return _read_text(path)
+        return _read_text(path), {}
     if suffix == ".json":
-        return _parse_json(path)
+        return _parse_json(path), {}
     if suffix in {".html", ".htm"}:
-        return _parse_html(path)
+        return _parse_html(path), {}
     if suffix == ".csv":
-        return _parse_delimited(path, delimiter=",")
+        return _parse_delimited(path, delimiter=","), {}
     if suffix == ".tsv":
-        return _parse_delimited(path, delimiter="\t")
+        return _parse_delimited(path, delimiter="\t"), {}
     if suffix == ".pdf":
-        from pypdf import PdfReader
-
-        text = "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
-        if ocr is None:
-            return text
-        if not text.strip():
-            return ocr(path)
-        extra = _pdf_images_text(path, ocr)
-        return f"{text}\n{extra}" if extra else text
+        return _parse_pdf(path, ocr)
     if suffix == ".docx":
-        return _with_zip_images(path, _parse_docx(path), "word/media/", ocr)
+        return _with_zip_images(path, _parse_docx(path), "word/media/", ocr), {}
     if suffix in {".wps", ".doc"}:
         from octop.infra.utils.anydoc_convert import extract_markdown_file
 
         text = extract_markdown_file(path)
         if not text.strip():
             raise ValueError(f"failed to extract text from {suffix} document")
-        return text
+        return text, {}
     if suffix == ".pptx":
-        from pptx import Presentation
-
-        text = "\n".join(
-            shape.text
-            for slide in Presentation(str(path)).slides
-            for shape in slide.shapes
-            if hasattr(shape, "text") and shape.text
-        )
-        return _with_zip_images(path, text, "ppt/media/", ocr)
+        return _parse_pptx(path, ocr)
     if suffix in {".xlsx", ".xlsm"}:
-        return _with_zip_images(path, _parse_xlsx(path), "xl/media/", ocr)
+        return _with_zip_images(path, _parse_xlsx(path), "xl/media/", ocr), {}
     if suffix == ".xls":
-        return _parse_xls(path)
+        return _parse_xls(path), {}
     raise ValueError(f"unsupported knowledge document extension: {suffix or '(none)'}")
 
 
-def _pdf_images_text(path: Path, ocr: OcrExtractor) -> str:
-    """OCR raster images embedded in a text PDF. Failures on one image are skipped."""
+class _ImageBag:
+    """First-seen rasters for one document. Repeated bytes and icons are dropped."""
+
+    def __init__(self) -> None:
+        self.images: dict[str, bytes] = {}
+        self._seen: set[bytes] = set()
+
+    def add(
+        self,
+        data: bytes,
+        *,
+        ext: str = "",
+        width: int | None = None,
+        height: int | None = None,
+    ) -> str | None:
+        if ext.lower().lstrip(".") in _VECTOR_IMAGE_EXTS:
+            return None
+        if _is_icon(data, width=width, height=height):
+            return None
+        digest = hashlib.sha256(data).digest()
+        if digest in self._seen:
+            return None
+        self._seen.add(digest)
+        image_id = digest.hex()[:12]
+        self.images[image_id] = data
+        return image_id
+
+
+def _marker_block(image_id: str, ocr_text: str) -> str:
+    body = ocr_text.strip()
+    if body:
+        return f"[[IMG:{image_id}]]\n{body}"
+    return f"[[IMG:{image_id}]]"
+
+
+def _parse_pdf(path: Path, ocr: OcrExtractor | None) -> tuple[str, dict[str, bytes]]:
+    from pypdf import PdfReader
+
+    page_texts = [page.extract_text() or "" for page in PdfReader(path).pages]
+    text = "\n".join(page_texts)
+    if ocr is None or not text.strip():
+        if ocr is not None and not text.strip():
+            return ocr(path), {}
+        return text, {}
+
     import pymupdf
 
-    pieces: list[str] = []
     try:
         document = pymupdf.open(path)
     except Exception:
-        return ""
+        return text, {}
+    bag = _ImageBag()
+    sections: list[str] = []
+    marked = False
     try:
-        for page in document:
-            for image in page.get_images(full=True):
-                try:
-                    data = document.extract_image(image[0])["image"]
-                except Exception:
-                    continue
-                text = ocr(data)
-                if len(text.strip()) >= _MIN_IMAGE_OCR_CHARS:
-                    pieces.append(text)
+        for index, page_text in enumerate(page_texts):
+            parts = [page_text] if page_text else []
+            if index < document.page_count:
+                for image in document[index].get_images(full=True):
+                    try:
+                        meta = document.extract_image(image[0])
+                        data = meta["image"]
+                    except Exception:
+                        continue
+                    image_id = bag.add(
+                        data,
+                        ext=str(meta.get("ext") or ""),
+                        width=_as_int(meta.get("width")),
+                        height=_as_int(meta.get("height")),
+                    )
+                    if image_id is None:
+                        continue
+                    parts.append(_marker_block(image_id, ocr(data)))
+                    marked = True
+            if parts:
+                sections.append("\n".join(parts))
     finally:
         document.close()
-    return "\n".join(pieces)
+    if not marked:
+        return text, {}
+    return "\n".join(sections), bag.images
+
+
+def _parse_pptx(path: Path, ocr: OcrExtractor | None) -> tuple[str, dict[str, bytes]]:
+    from pptx import Presentation
+
+    bag = _ImageBag()
+    pieces: list[str] = []
+    for slide in Presentation(str(path)).slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text:
+                pieces.append(shape.text)
+            if ocr is None:
+                continue
+            try:
+                image = getattr(shape, "image", None)
+                if image is None:
+                    continue
+                data = image.blob
+                ext = str(getattr(image, "ext", "") or "")
+            except Exception:
+                continue
+            image_id = bag.add(data, ext=ext)
+            if image_id is None:
+                continue
+            pieces.append(_marker_block(image_id, ocr(data)))
+    return "\n".join(pieces), bag.images if ocr is not None else {}
+
+
+def _as_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return int(value)
+
+
+def _is_icon(data: bytes, *, width: int | None = None, height: int | None = None) -> bool:
+    if width is not None and height is not None:
+        return width < _MIN_CONTENT_IMAGE_PX and height < _MIN_CONTENT_IMAGE_PX
+    size = _raster_size(data)
+    if size is None:
+        return False
+    return size[0] < _MIN_CONTENT_IMAGE_PX and size[1] < _MIN_CONTENT_IMAGE_PX
+
+
+def _raster_size(data: bytes) -> tuple[int, int] | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        return struct.unpack(">II", data[16:24])
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) >= 10:
+        return struct.unpack("<HH", data[6:10])
+    if data.startswith(b"\xff\xd8"):
+        return _jpeg_size(data)
+    if len(data) >= 30 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return _webp_size(data)
+    return None
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int] | None:
+    index = 2
+    limit = len(data)
+    while index + 8 < limit:
+        if data[index] != 0xFF:
+            index += 1
+            continue
+        marker = data[index + 1]
+        if marker in {0xC0, 0xC1, 0xC2}:
+            height, width = struct.unpack(">HH", data[index + 5 : index + 9])
+            return width, height
+        if marker in {0xD8, 0xD9}:
+            break
+        if index + 4 > limit:
+            break
+        segment = struct.unpack(">H", data[index + 2 : index + 4])[0]
+        if segment < 2:
+            break
+        index += 2 + segment
+    return None
+
+
+def _webp_size(data: bytes) -> tuple[int, int] | None:
+    chunk = data[12:16]
+    if chunk == b"VP8X" and len(data) >= 30:
+        width = 1 + int.from_bytes(data[24:27], "little")
+        height = 1 + int.from_bytes(data[27:30], "little")
+        return width, height
+    if chunk == b"VP8 " and len(data) >= 30:
+        width, height = struct.unpack("<HH", data[26:30])
+        return width & 0x3FFF, height & 0x3FFF
+    if chunk == b"VP8L" and len(data) >= 25:
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    return None
 
 
 _ZIP_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}

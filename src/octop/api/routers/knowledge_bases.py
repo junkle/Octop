@@ -816,6 +816,38 @@ async def download_document_file(
 
 
 @router.get(
+    "/{kb_id}/documents/{doc_id}/images/{image_id}",
+    summary="Download one image extracted from a knowledge document",
+    response_class=FileResponse,
+)
+async def download_document_image(
+    kb_id: str,
+    doc_id: str,
+    image_id: str,
+    request: Request,
+    server: OctopServer = Depends(get_server),
+    user: User = Depends(current_user),
+) -> FileResponse:
+    try:
+        path, filename, content_type = _knowledge_service(server).resolve_document_image(
+            kb_id,
+            doc_id,
+            image_id,
+            actor_user_id=user.id,
+            is_admin=_is_admin(user),
+        )
+    except Exception as exc:
+        raise _map_knowledge_error(
+            exc, locale=resolve_request_locale(request), server=server
+        ) from exc
+    return FileResponse(
+        path=path,
+        media_type=content_type or "application/octet-stream",
+        headers={"Content-Disposition": content_disposition(filename)},
+    )
+
+
+@router.get(
     "/{kb_id}/documents/{doc_id}/content",
     summary="Read raw editable text for a markdown or plain-text document",
 )

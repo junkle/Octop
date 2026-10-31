@@ -3,7 +3,6 @@ import {
   useEffect,
   useRef,
   useState,
-  useCallback,
   useMemo,
   type CSSProperties,
   type ReactNode,
@@ -18,6 +17,7 @@ import {
   AuthFileDownloadLink,
   isAuthDownloadHref,
 } from "../AuthFileDownloadLink";
+import { useAuthImageSrc } from "../../hooks/useAuthImageSrc";
 import { isShellLanguage } from "../../utils/shellCodeBlock";
 import { copyText } from "../../utils/copyText";
 import { loadMermaid } from "./mermaidLoader";
@@ -155,25 +155,23 @@ function resolveImageSrc(src: string): string {
   return src;
 }
 
-/** Markdown image with automatic file:// → /api/workspace/media conversion and error fallback. */
+/** Markdown image. Local Octop files are read with the page login, not a bare img URL. */
 function MarkdownImage({
   src,
   alt,
   ...props
 }: { src?: string; alt?: string } & ImgHTMLAttributes<HTMLImageElement>) {
   const resolved = resolveImageSrc(src || "");
-  const [imgSrc, setImgSrc] = useState(resolved);
-  const failed = useRef(false);
+  const { src: loadedSrc, loadState } = useAuthImageSrc(resolved);
 
-  const handleError = useCallback(() => {
-    if (failed.current) return;
-    failed.current = true;
-    // If the resolved URL also fails (e.g. image not in workspace), show alt text gracefully
-    setImgSrc("");
-  }, []);
-
-  if (!imgSrc) {
-    // Render a subtle placeholder instead of a broken image icon
+  if (!resolved || loadState === "error" || !loadedSrc) {
+    if (loadState === "loading") {
+      return (
+        <span style={{ color: "var(--fn-text-tertiary, #999)", fontSize: 13 }}>
+          …
+        </span>
+      );
+    }
     return (
       <span style={{ color: "var(--fn-text-tertiary, #999)", fontSize: 13 }}>
         [{alt || "image"}]
@@ -183,9 +181,8 @@ function MarkdownImage({
 
   return (
     <img
-      src={imgSrc}
+      src={loadedSrc}
       alt={alt}
-      onError={handleError}
       style={{ maxWidth: "100%", borderRadius: 8 }}
       {...props}
     />

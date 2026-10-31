@@ -11,8 +11,10 @@ from typing import Any, cast
 from octop.config import DEFAULT_MAX_UPLOAD_MB, upload_mb_to_bytes
 from octop.infra.db.repos.knowledge import KnowledgeBaseRow, KnowledgeDocumentRow
 from octop.infra.knowledge.files import (
+    delete_document_assets,
     delete_document_file,
     delete_knowledge_base_files,
+    document_asset_file,
     document_path,
     write_document,
 )
@@ -217,6 +219,34 @@ class KnowledgeService:
             raise FileNotFoundError("knowledge document original file not found")
         return path, document.filename, document.content_type
 
+    def resolve_document_image(
+        self, kb_id: str, doc_id: str, image_id: str, *, actor_user_id: int, is_admin: bool = False
+    ) -> tuple[Path, str, str]:
+        """Return one extracted raster, or the original when ``image_id`` is ``self``."""
+        if image_id == "self":
+            path, filename, content_type = self.resolve_document_file(
+                kb_id, doc_id, actor_user_id=actor_user_id, is_admin=is_admin
+            )
+            if Path(filename).suffix.lower() not in OCR_IMAGE_SUFFIXES:
+                raise LookupError("knowledge document image not found")
+            return path, filename, content_type
+        self.get_readable_base(kb_id, actor_user_id=actor_user_id, is_admin=is_admin)
+        document = self._repo.get_document(doc_id)
+        if document is None or document.kb_id != kb_id or document.is_dir:
+            raise LookupError("knowledge document not found")
+        path = document_asset_file(kb_id, doc_id, image_id)
+        if path is None:
+            raise FileNotFoundError("knowledge document image not found")
+        media_type = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+            ".bmp": "image/bmp",
+        }.get(path.suffix.lower(), "application/octet-stream")
+        return path, path.name, media_type
+
     def document_has_original(self, document: KnowledgeDocumentRow) -> bool:
         """True when the uploaded original still exists on disk."""
         if document.is_dir:
@@ -405,6 +435,7 @@ class KnowledgeService:
                 continue
             KnowledgeIndex(kb_id).delete_doc(row.id)
             delete_document_file(kb_id, row.id, row.filename)
+            delete_document_assets(kb_id, row.id)
 
     def reindex_document(
         self, kb_id: str, doc_id: str, *, actor_user_id: int, is_admin: bool = False
