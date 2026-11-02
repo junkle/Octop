@@ -273,10 +273,7 @@ def optional_ocr_extractor(services: Any) -> OcrExtractor | None:
     return extract
 
 
-def _image_inputs(path: Path | bytes) -> Iterator[tuple[bytes, str]]:
-    if isinstance(path, bytes):
-        yield path, "image/png"
-        return
+def _image_inputs(path: Path) -> Iterator[tuple[bytes, str]]:
     if path.suffix.lower() != ".pdf":
         media_type = {
             ".jpg": "image/jpeg",
@@ -351,7 +348,7 @@ class _RemoteOcr:
                 # result instead fails the document with "no extractable text".
                 logger.warning(
                     "remote OCR returned a no-image refusal for %s; treating the page as empty",
-                    getattr(path, "name", "image"),
+                    path.name,
                 )
                 continue
             parts.append(text)

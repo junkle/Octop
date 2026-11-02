@@ -44,11 +44,6 @@ export function needsAuthBlobFetch(url: string): boolean {
   ) {
     return true;
   }
-  if (
-    /^\/api\/knowledge-bases\/[^/]+\/documents\/[^/]+\/images\/[^/]+$/.test(path)
-  ) {
-    return true;
-  }
   return false;
 }
 
