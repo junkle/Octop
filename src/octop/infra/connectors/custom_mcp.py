@@ -7,6 +7,7 @@ import re
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+from octop.i18n.domains.errors import error_message
 from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.utils.ssrf_guard import (
     UnsafeOutboundUrl,
@@ -170,9 +171,11 @@ def validate_mcp_http_url(url: str) -> str:
     # public DNS names (for example ``*.leisai.com``). Anything else must use
     # HTTPS so arbitrary user-configured public HTTP targets stay blocked.
     if parsed.scheme == "http" and not _http_host_allowed(host):
+        details = {"host": host}
         raise OctopError(
             ErrorCode.CONNECTOR_MCP_HTTPS_REQUIRED,
-            "public MCP server URLs must use https",
+            error_message(ErrorCode.CONNECTOR_MCP_HTTPS_REQUIRED.value, "en", **details),
+            details=details,
         )
     if parsed.scheme == "https":
         try:
