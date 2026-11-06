@@ -1,14 +1,16 @@
-"""SSE bridge for expert turns: streaming text, coarse tool status, no reasoning.
+"""SSE bridge for expert turns: streaming text, coarse tool status, artifacts, no reasoning.
 
-只做三件事：
+只做四件事：
   1. token chunk  → SSE `token` 帧（正文真增量）
   2. tool_call_chunk / tool_result → 折叠成 `tool` 帧，仅暴露 start/end，不带工具名
-  3. reasoning chunk 直接丢弃（思考过程永不出网）
+  3. attachment chunk → `artifact` 帧（字段原样，来自 gateway 的白名单+去重结果）
+  4. reasoning chunk 直接丢弃（思考过程永不出网）
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -16,12 +18,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from octop_gateway.models import ChannelSubject, InboundMessage, TextContent
+from octop_gateway.models import InboundMessage
 
-from octop.infra.agent_mcp.service import (
-    MCP_CHANNEL_ID,
-    AgentMcpGatewayService,
-)
+from octop.infra.agent_mcp.attachments import validate_attachments, validate_turn
+from octop.infra.agent_mcp.service import AgentMcpGatewayService
 from octop.infra.gateway.hitl.coordinator import HitlStreamContext
 from octop.infra.gateway.hitl.format import normalize_hitl_request
 from octop.infra.gateway.threads import ThreadRegistry
@@ -117,14 +117,17 @@ class ExpertStreamService(AgentMcpGatewayService):
         message: Any,
         thread_id: str | None = None,
         caller_meta: dict[str, Any] | None = None,
+        attachments: object = None,
     ) -> PreparedTurn:
-        """开流前的全部校验：专家可见性、消息长度、thread 归属、身份白名单。
+        """开流前的全部校验：专家可见性、消息长度、thread 归属、身份白名单、附件路径。
 
         任何一项不过都抛异常，调用方还能回 4xx —— 一旦返回了
         `text/event-stream` 就没法再改 HTTP 状态码了。
         """
         row = self._require_expert(expert_id, user)
-        text = self._validate_message(message)
+        # 附件先校验再组装：文本与附件不可同时为空（纯图片消息合法）
+        normalized = validate_attachments(attachments)
+        text = validate_turn(message, normalized)
         thread, session_key = await self._resolve_thread(
             expert_id=row.agent_id,
             user=user,
@@ -137,14 +140,13 @@ class ExpertStreamService(AgentMcpGatewayService):
         }
         # 只放行白名单 key；session_key、thread_id、user_is_admin 不可被外部覆盖。
         _merge_caller_meta(meta, caller_meta)
-        inbound = InboundMessage(
-            channel_id=MCP_CHANNEL_ID,
-            channel_type=ThreadRegistry.CHANNEL_MCP,
-            tenant_id=row.agent_id,
-            channel_subject=ChannelSubject(subject_id=str(user.id)),
-            channel_session_id=session_key,
-            content=[TextContent(text=text)],
-            metadata=meta,
+        inbound = self._build_inbound(
+            row=row,
+            user=user,
+            session_key=session_key,
+            text=text,
+            attachments=normalized,
+            meta=meta,
         )
         return PreparedTurn(
             expert_id=row.agent_id,
@@ -163,6 +165,7 @@ class ExpertStreamService(AgentMcpGatewayService):
         expert_id = prepared.expert_id
         thread_id = prepared.thread_id
         parts: list[str] = []
+        artifacts: list[dict[str, Any]] = []
         usage: dict[str, Any] | None = None
         tracker = _ToolTracker()
         status = "completed"
@@ -183,9 +186,7 @@ class ExpertStreamService(AgentMcpGatewayService):
 
         async def _pump() -> None:
             try:
-                async for chunk in self._gateway.processor.iter_turn_chunks(
-                    prepared.inbound
-                ):
+                async for chunk in self._gateway.processor.iter_turn_chunks(prepared.inbound):
                     await queue.put(("chunk", chunk))
                 await queue.put(("end", None))
             except asyncio.CancelledError:
@@ -198,14 +199,10 @@ class ExpertStreamService(AgentMcpGatewayService):
         try:
             while True:
                 try:
-                    kind, payload = await asyncio.wait_for(
-                        queue.get(), timeout=HEARTBEAT_SECONDS
-                    )
-                except asyncio.TimeoutError:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+                except TimeoutError:
                     yield sse_frame("heartbeat", {})
-                    if is_disconnected is not None and await _safe_disconnected(
-                        is_disconnected
-                    ):
+                    if is_disconnected is not None and await _safe_disconnected(is_disconnected):
                         break
                     continue
 
@@ -219,9 +216,7 @@ class ExpertStreamService(AgentMcpGatewayService):
                         thread_id,
                     )
                     status = "failed"
-                    error = {
-                        "message": str(exc) or exc.__class__.__name__
-                    }
+                    error = {"message": str(exc) or exc.__class__.__name__}
                     yield sse_frame("error", error)
                     break
 
@@ -239,16 +234,21 @@ class ExpertStreamService(AgentMcpGatewayService):
                 elif ctype == "tool_call_chunk":
                     call_id = tracker.on_call_chunk(chunk)
                     if call_id is not None:
-                        yield sse_frame(
-                            "tool", {"call_id": call_id, "phase": "start"}
-                        )
+                        yield sse_frame("tool", {"call_id": call_id, "phase": "start"})
 
                 elif ctype == "tool_result":
                     call_id = tracker.on_result()
                     if call_id is not None:
-                        yield sse_frame(
-                            "tool", {"call_id": call_id, "phase": "end"}
-                        )
+                        yield sse_frame("tool", {"call_id": call_id, "phase": "end"})
+
+                elif ctype == "attachment":
+                    # gateway 已按工具白名单与去重产出；这里只投递并换 event 名
+                    artifact = await self._deliver_artifact(
+                        {k: v for k, v in chunk.items() if k != "type"},
+                        agent_id=expert_id,
+                    )
+                    artifacts.append(artifact)
+                    yield sse_frame("artifact", artifact)
 
                 elif ctype == "usage":
                     if isinstance(chunk.get("usage"), dict):
@@ -259,18 +259,15 @@ class ExpertStreamService(AgentMcpGatewayService):
                     pending_id = chunk.get("pending_id")
                     if isinstance(request, dict):
                         request = normalize_hitl_request(request)
-                        record = (
-                            self._gateway.processor.hitl_coordinator
-                            .register_from_request(
-                                request,
-                                ctx=HitlStreamContext(
-                                    thread_id=thread_id,
-                                    agent_id=expert_id,
-                                    user_id=user_id,
-                                    session_key=prepared.session_key,
-                                    channel_type=ThreadRegistry.CHANNEL_MCP,
-                                ),
-                            )
+                        record = self._gateway.processor.hitl_coordinator.register_from_request(
+                            request,
+                            ctx=HitlStreamContext(
+                                thread_id=thread_id,
+                                agent_id=expert_id,
+                                user_id=user_id,
+                                session_key=prepared.session_key,
+                                channel_type=ThreadRegistry.CHANNEL_MCP,
+                            ),
                         )
                         pending_id = record.pending_id
                         request = {**request, "pending_id": pending_id}
@@ -280,11 +277,7 @@ class ExpertStreamService(AgentMcpGatewayService):
                     break
 
                 elif ctype == "error":
-                    error = {
-                        "message": str(
-                            chunk.get("message") or "expert call failed"
-                        )
-                    }
+                    error = {"message": str(chunk.get("message") or "expert call failed")}
                     if chunk.get("error_code"):
                         error["code"] = str(chunk["error_code"])
                     status = "failed"
@@ -296,19 +289,16 @@ class ExpertStreamService(AgentMcpGatewayService):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            _log.exception(
-                "expert stream failed: expert=%s thread=%s", expert_id, thread_id
-            )
+            _log.exception("expert stream failed: expert=%s thread=%s", expert_id, thread_id)
             status = "failed"
             error = {"message": str(exc) or exc.__class__.__name__}
             yield sse_frame("error", error)
         finally:
             if not pump_task.done():
                 pump_task.cancel()
-                try:
+                # 取消后的收尾异常无关紧要（含 CancelledError），一律吞掉
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await pump_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
 
         done: dict[str, Any] = {
             "status": status,
@@ -322,4 +312,7 @@ class ExpertStreamService(AgentMcpGatewayService):
             done["approval"] = approval
         if usage:
             done["usage"] = usage
+        # 与 hitl/approval 一样双写：流里逐帧推，结束再汇总一次便于一次性落库
+        if artifacts:
+            done["artifacts"] = artifacts
         yield sse_frame("done", done)

@@ -107,6 +107,8 @@ on each start. Schema (`OctopConfig` in `octop/config.py`):
   "enable_api_docs": false,
   "require_setup_password": true,
   "max_upload_mb": 100,
+  "artifact_sink_url": null,
+  "artifact_sink_timeout_seconds": 15,
   "database": {
     "driver": "sqlite",
     "sqlite_path": "octop.db",
@@ -155,6 +157,15 @@ Notes:
   impose their own body-size limit (for example nginx
   `client_max_body_size`). Agent workspace file upload, plugin ZIPs,
   and backup archives use separate limits and are not this setting.
+- `artifact_sink_url` is the optional **artifact delivery** endpoint for the
+  MCP gateway. When set, every produced artifact is uploaded there as
+  multipart `file` before its frame is emitted, and the frame carries the URL
+  the endpoint returns (see [api.md](./api.md#streaming-expert-turns)). Unset
+  means frames keep the relative Octop download URL, exactly as before.
+  `artifact_sink_timeout_seconds` (default 15) bounds each upload. The
+  matching token is **never** written to `config.json` — supply it through
+  `OCTOP_ARTIFACT_SINK_TOKEN` (or `~/.octop/env`). Artifacts larger than
+  `max_upload_bytes` are skipped and fall back to the original URL.
 - `plugins.<id>.enabled` is the **global** plugin switch (Dashboard Admin →
   Plugins). Bundled plugins are copied into `~/.octop/plugins/` on init and
   server start with `enabled: false`. `bundled_plugins_seeded` lists ids
@@ -189,6 +200,9 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_ENABLE_API_DOCS` | bool | `false` | Expose Scalar API docs at `/api/docs` |
 | `OCTOP_REQUIRE_SETUP_PASSWORD` | bool | `true` | Require wizard password during initial setup |
 | `OCTOP_MAX_UPLOAD_MB` | int | `100` | Max upload size in MiB for chat attachments, IM inbound, and knowledge documents (1–1024) |
+| `OCTOP_ARTIFACT_SINK_URL` | string | empty | Multipart endpoint that receives MCP artifacts before emission; empty disables delivery |
+| `OCTOP_ARTIFACT_SINK_TOKEN` | string | empty | Bearer token for the sink endpoint; never logged and never written to `config.json` |
+| `OCTOP_ARTIFACT_SINK_TIMEOUT_SECONDS` | int | `15` | Per-upload timeout for artifact delivery |
 | `OCTOP_DATABASE_URL` | string | empty | Full DSN — overrides the `OCTOP_DATABASE_*` fields below |
 | `OCTOP_DATABASE_DRIVER` | `sqlite` \| `postgresql` | `sqlite` | Storage backend |
 | `OCTOP_DATABASE_SQLITE_PATH` | path | `octop.db` | SQLite file path (relative to `OCTOP_HOME` unless absolute) |

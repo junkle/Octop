@@ -2,28 +2,37 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
-from octop_gateway.models import ChannelSubject, InboundMessage, TextContent
+from octop_gateway.models import ChannelSubject, ContentPart, InboundMessage, TextContent
 
+from octop.infra.agent_mcp.attachments import (
+    build_content_parts,
+    validate_attachments,
+    validate_turn,
+)
 from octop.infra.errors import ErrorCode, OctopError
 from octop.infra.gateway.hitl.coordinator import (
     HitlStreamContext,
     decision_rejection_reason,
 )
 from octop.infra.gateway.hitl.format import normalize_hitl_request
+from octop.infra.gateway.process.agent_resolve import harness_workspace_for_agent
 from octop.infra.gateway.threads import ThreadRegistry
 from octop.infra.utils.ulid import new_ulid
 
 if TYPE_CHECKING:
+    from octop.infra.agent_mcp.artifact_sink import ArtifactSink
     from octop.infra.agents.manager import AgentManager
     from octop.infra.gateway.gateway import Gateway
     from octop.infra.gateway.hitl.store import HitlPendingRecord
     from octop.infra.users.identity import User
 
+_log = logging.getLogger(__name__)
+
 MCP_CHANNEL_ID = "octop-agent-mcp"
-_MAX_MESSAGE_CHARS = 100_000
 _MAX_DECISIONS = 16
 _MAX_DECISION_MESSAGE_CHARS = 100_000
 _DECISION_TYPES = frozenset({"approve", "edit", "reject", "respond"})
@@ -32,9 +41,16 @@ _DECISION_TYPES = frozenset({"approve", "edit", "reject", "respond"})
 class AgentMcpGatewayService:
     """Expose accessible Octop experts through a small, isolated call surface."""
 
-    def __init__(self, *, agent_manager: AgentManager, gateway: Gateway) -> None:
+    def __init__(
+        self,
+        *,
+        agent_manager: AgentManager,
+        gateway: Gateway,
+        artifact_sink: ArtifactSink | None = None,
+    ) -> None:
         self._agent_manager = agent_manager
         self._gateway = gateway
+        self._artifact_sink = artifact_sink
 
     def list_experts(self, user: User) -> dict[str, Any]:
         experts = []
@@ -62,9 +78,12 @@ class AgentMcpGatewayService:
         message: str,
         thread_id: str | None = None,
         caller_meta: dict[str, Any] | None = None,
+        attachments: object = None,
     ) -> dict[str, Any]:
         row = self._require_expert(expert_id, user)
-        text = self._validate_message(message)
+        # 与流式分支共用同一套校验与装配：文本与附件不可同时为空
+        normalized = validate_attachments(attachments)
+        text = validate_turn(message, normalized)
         thread, session_key = await self._resolve_thread(
             expert_id=row.agent_id,
             user=user,
@@ -79,14 +98,13 @@ class AgentMcpGatewayService:
         # 供专家在本轮 turn 调用上游 MCP 工具时做数据权限过滤。
         if caller_meta:
             meta.update({k: v for k, v in caller_meta.items() if v is not None})
-        inbound = InboundMessage(
-            channel_id=MCP_CHANNEL_ID,
-            channel_type=ThreadRegistry.CHANNEL_MCP,
-            tenant_id=row.agent_id,
-            channel_subject=ChannelSubject(subject_id=str(user.id)),
-            channel_session_id=session_key,
-            content=[TextContent(text=text)],
-            metadata=meta,
+        inbound = self._build_inbound(
+            row=row,
+            user=user,
+            session_key=session_key,
+            text=text,
+            attachments=normalized,
+            meta=meta,
         )
         chunks = self._gateway.processor.iter_turn_chunks(inbound)
         return await self._collect_result(
@@ -235,14 +253,41 @@ class AgentMcpGatewayService:
     def _can_access(row: Any, user: User) -> bool:
         return bool(user.is_admin or row.user_id == user.id or row.is_shared)
 
-    @staticmethod
-    def _validate_message(message: str) -> str:
-        text = str(message or "").strip()
-        if not text:
-            raise ValueError("message is required")
-        if len(text) > _MAX_MESSAGE_CHARS:
-            raise ValueError(f"message exceeds {_MAX_MESSAGE_CHARS} characters")
-        return text
+    def _build_inbound(
+        self,
+        *,
+        row: Any,
+        user: User,
+        session_key: str,
+        text: str,
+        attachments: list[dict[str, Any]],
+        meta: dict[str, Any],
+    ) -> InboundMessage:
+        """唯一的 MCP 入站消息构造点：文本 + 附件装配，流式与非流式共用。
+
+        ``thread_id`` 已随 ``meta`` 下发，这里不再单独传参。
+        """
+        content: list[ContentPart] = []
+        if text:
+            content.append(TextContent(text=text))
+        content.extend(build_content_parts(attachments))
+        if attachments:
+            # 只记数量与类型，不记文件名与内容
+            _log.info(
+                "expert turn attachments: expert=%s count=%d media=%s",
+                row.agent_id,
+                len(attachments),
+                ",".join(str(item["media_type"]) for item in attachments),
+            )
+        return InboundMessage(
+            channel_id=MCP_CHANNEL_ID,
+            channel_type=ThreadRegistry.CHANNEL_MCP,
+            tenant_id=row.agent_id,
+            channel_subject=ChannelSubject(subject_id=str(user.id)),
+            channel_session_id=session_key,
+            content=content,
+            metadata=meta,
+        )
 
     @staticmethod
     def _validate_decisions(decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -270,14 +315,23 @@ class AgentMcpGatewayService:
             normalized.append(dict(decision))
         return normalized
 
-    @staticmethod
+    async def _deliver_artifact(self, frame: dict[str, Any], *, agent_id: str) -> dict[str, Any]:
+        """把产物帧投递到下游 sink；未配置或失败时原样返回。"""
+        sink = self._artifact_sink
+        if sink is None or not sink.enabled:
+            return frame
+        workspace = harness_workspace_for_agent(self._agent_manager, agent_id)
+        return await sink.deliver(frame, workspace=workspace, agent_id=agent_id)
+
     async def _collect_result(
+        self,
         chunks: Any,
         *,
         expert_id: str,
         thread_id: str,
     ) -> dict[str, Any]:
         text_parts: list[str] = []
+        artifacts: list[dict[str, Any]] = []
         error: dict[str, Any] | None = None
         approval: dict[str, Any] | None = None
         usage: dict[str, Any] | None = None
@@ -289,6 +343,9 @@ class AgentMcpGatewayService:
                 text = chunk.get("content", chunk.get("text", ""))
                 if text:
                     text_parts.append(str(text))
+            elif kind == "attachment":
+                frame = {k: v for k, v in chunk.items() if k != "type"}
+                artifacts.append(await self._deliver_artifact(frame, agent_id=expert_id))
             elif kind == "error":
                 error = {
                     "message": str(chunk.get("message") or "expert call failed"),
@@ -319,4 +376,6 @@ class AgentMcpGatewayService:
             result["approval"] = approval
         if usage:
             result["usage"] = usage
+        if artifacts:
+            result["artifacts"] = artifacts
         return result

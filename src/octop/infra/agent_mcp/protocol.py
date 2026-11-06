@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
 
+from octop.infra.agent_mcp.attachments import MAX_MCP_ATTACHMENTS, TURN_RESERVED_ARGS
 from octop.infra.errors import OctopError
 
 if TYPE_CHECKING:
@@ -41,10 +42,33 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "expert_id": {"type": "string", "minLength": 1},
-                "message": {"type": "string", "minLength": 1, "maxLength": 100000},
+                # 允许只带附件不写文字：占位文案由平台侧生成
+                "message": {"type": "string", "maxLength": 100000},
                 "thread_id": {"type": "string", "minLength": 1},
+                "attachments": {
+                    "type": "array",
+                    "maxItems": MAX_MCP_ATTACHMENTS,
+                    "description": (
+                        "Files already uploaded to the expert workspace. Each path must be a "
+                        "workspace-relative path under inbound/ (upload via "
+                        "POST /api/agents/{agent_id}/upload first). Images under inbound/ are "
+                        "sent to the model as vision input, other files as readable attachments."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "minLength": 1},
+                            "workspace_path": {"type": "string", "minLength": 1},
+                            "filename": {"type": "string"},
+                            "media_type": {"type": "string"},
+                            "mime_type": {"type": "string"},
+                        },
+                        "anyOf": [{"required": ["path"]}, {"required": ["workspace_path"]}],
+                        "additionalProperties": True,
+                    },
+                },
             },
-            "required": ["expert_id", "message"],
+            "required": ["expert_id"],
             "additionalProperties": False,
         },
     },
@@ -134,11 +158,11 @@ async def handle_agent_mcp_request(
         if name == "list_octop_experts":
             result = service.list_experts(user)
         elif name == "call_octop_expert":
-            # 除核心三参外，其余参数（如 ITR 声明的 itr_user_id/wecom_user_id/business_context）
+            # 除核心参数外，其余参数（如 ITR 声明的 itr_user_id/wecom_user_id/business_context）
             # 作为调用方身份透传，供专家在本轮 turn 回调上游 MCP 工具时做数据权限过滤。
+            # attachments 是内容而非身份，必须从 caller_meta 排除后单独透传。
             caller_meta = {
-                k: v for k, v in arguments.items()
-                if k not in {"expert_id", "message", "thread_id"} and v is not None
+                k: v for k, v in arguments.items() if k not in TURN_RESERVED_ARGS and v is not None
             }
             result = await service.call_expert(
                 user,
@@ -146,6 +170,7 @@ async def handle_agent_mcp_request(
                 message=str(arguments.get("message") or ""),
                 thread_id=(str(arguments["thread_id"]) if arguments.get("thread_id") else None),
                 caller_meta=caller_meta or None,
+                attachments=arguments.get("attachments"),
             )
         elif name == "resume_octop_expert":
             raw_decisions = arguments.get("decisions")

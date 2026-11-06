@@ -143,6 +143,11 @@ class OctopConfig:
     capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
     max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
     browser_idle_timeout_minutes: int = DEFAULT_BROWSER_IDLE_TIMEOUT_MINUTES
+    # Artifact delivery sink: when set, MCP artifact frames are uploaded to this
+    # endpoint first and carry the URL it returns (see artifact_sink.py).
+    artifact_sink_url: str | None = None
+    artifact_sink_token: str | None = None
+    artifact_sink_timeout_seconds: int = 15
 
     @property
     def max_upload_bytes(self) -> int:
@@ -152,6 +157,8 @@ class OctopConfig:
 def _defaults_for_file() -> dict[str, Any]:
     data = asdict(OctopConfig())
     data.pop("database_in_file", None)
+    # Secrets stay in the environment; never seed them into config.json.
+    data.pop("artifact_sink_token", None)
     db = dict(data["database"])
     db.pop("password", None)
     db.pop("url", None)
@@ -515,6 +522,15 @@ def load_config(path: Path) -> OctopConfig:
             ),
         )
 
+    if v := os.environ.get("OCTOP_ARTIFACT_SINK_URL"):
+        merged["artifact_sink_url"] = v.strip() or None
+    if v := os.environ.get("OCTOP_ARTIFACT_SINK_TOKEN"):
+        merged["artifact_sink_token"] = v.strip() or None
+    if v := os.environ.get("OCTOP_ARTIFACT_SINK_TIMEOUT_SECONDS"):
+        merged["artifact_sink_timeout_seconds"] = _coerce_int(
+            "OCTOP_ARTIFACT_SINK_TIMEOUT_SECONDS", v, 15
+        )
+
     capabilities = _parse_capabilities_section(raw.get("capabilities"))
     if v := os.environ.get("OCTOP_ENABLE_MOBILE"):
         forced = _coerce_bool("OCTOP_ENABLE_MOBILE", v, capabilities.mobile.enabled)
@@ -630,4 +646,7 @@ def load_config(path: Path) -> OctopConfig:
                 )
             ),
         ),
+        artifact_sink_url=merged.get("artifact_sink_url"),
+        artifact_sink_token=merged.get("artifact_sink_token"),
+        artifact_sink_timeout_seconds=max(1, int(merged.get("artifact_sink_timeout_seconds", 15))),
     )

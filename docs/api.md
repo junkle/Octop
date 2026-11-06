@@ -578,6 +578,99 @@ Example client configuration:
 The exact transport key differs by MCP client. Some clients use `http`
 instead of `streamable_http`.
 
+### Streaming expert turns
+
+`POST /mcp/agents/stream` runs one expert turn and returns
+`text/event-stream`. Request body:
+
+```json
+{
+  "expert_id": "exp-xxx",
+  "message": "这张图里的指标异常吗",
+  "thread_id": "optional, from a previous ack/done",
+  "attachments": [
+    {
+      "path": "inbound/1730000000_chart.png",
+      "mime_type": "image/png",
+      "filename": "chart.png"
+    }
+  ],
+  "itr_user_id": 1997
+}
+```
+
+`message` and `attachments` cannot both be empty. `attachments` accepts at most
+8 items; each `path` must be a workspace-relative path under `inbound/`,
+obtained from `POST /agents/{aid}/upload` (`path` / `workspace_path` in that
+response). Invalid paths or malformed entries return 4xx before the stream
+opens — once the response is `text/event-stream` the status code can no longer
+change. `attachments` is content, not caller identity: it is never forwarded
+into turn metadata.
+
+Images under `inbound/` become vision input (first 4 images, each capped at
+2 MB; anything beyond that degrades to a path hint instead of failing the
+turn). Other files are passed to the model as file attachments. `call_octop_expert`
+accepts the same `attachments` array.
+
+Events:
+
+| Event | Payload |
+|-------|---------|
+| `ack` | `expert_id`, `thread_id`, `ts` |
+| `token` | `text` — incremental answer text |
+| `tool` | `call_id`, `phase` (`start` / `end`) — tool names are intentionally hidden |
+| `artifact` | one produced file, see below |
+| `heartbeat` | empty object, every 15 s |
+| `hitl` | `pending_id`, `request` — resume via `resume_octop_expert` |
+| `error` | `message`, optional `code` |
+| `done` | `status` (`completed` / `failed` / `approval_required`), `expert_id`, `thread_id`, `response`, plus `artifacts` / `approval` / `usage` / `error` when present |
+
+`artifact` reuses the dashboard attachment frame:
+
+```json
+{
+  "kind": "image",
+  "url": "/api/agents/exp-xxx/workspace/download?path=outbound%2Fchart.png",
+  "preview_url": "/api/agents/exp-xxx/workspace/download?path=outbound%2Fchart.png",
+  "filename": "chart.png",
+  "mime_type": "image/png",
+  "path": "outbound/chart.png"
+}
+```
+
+Artifacts are produced only by delivery tools (`send_file`, `send_file_to_user`,
+`desktop_screenshot`, `mobile_screenshot`, `generate_image`, `generate_video`),
+already deduplicated per turn. `done.artifacts` repeats the full list so a
+client can persist once at the end, and always matches the `artifact` frames
+emitted during the turn. By default `url` is relative to the Octop base URL and
+requires the same JWT to fetch — resolve it with an authenticated request
+rather than binding it directly to an `<img>` tag.
+
+**Artifact delivery sink.** When `OCTOP_ARTIFACT_SINK_URL` is configured,
+Octop uploads each artifact's bytes to that endpoint (multipart field `file`,
+optional `Authorization: Bearer $OCTOP_ARTIFACT_SINK_TOKEN`) before emitting
+the frame, and `url` / `preview_url` become the absolute URL returned by the
+endpoint. The original relative address is kept as `octop_url`:
+
+```json
+{
+  "kind": "file",
+  "url": "http://itr.example/admin-api/infra/file/12/get/report.pdf",
+  "preview_url": "http://itr.example/admin-api/infra/file/12/get/report.pdf",
+  "octop_url": "/api/agents/exp-xxx/workspace/download?path=generated%2Freport.pdf",
+  "filename": "report.pdf",
+  "mime_type": "application/pdf",
+  "path": "generated/report.pdf"
+}
+```
+
+The endpoint's response may be a bare URL string or JSON carrying it under
+`url`, `file_url`, `fileUrl`, `data`, or `result`. Delivery never fails a turn:
+when the sink is unset, the file is missing, larger than `max_upload_mb`, or
+the upload/response is unusable, the frame is emitted unchanged (relative
+URL, no `octop_url`) and only a warning is logged. See
+[configuration.md](./configuration.md) for the settings.
+
 ## Observability & security
 
 | Method | Path | Auth | Notes |

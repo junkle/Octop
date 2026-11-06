@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from octop.api.deps import current_user, get_server
+from octop.infra.agent_mcp.artifact_sink import ArtifactSink
+from octop.infra.agent_mcp.attachments import TURN_RESERVED_ARGS
 from octop.infra.agent_mcp.protocol import handle_agent_mcp_request
 from octop.infra.agent_mcp.service import AgentMcpGatewayService
 from octop.infra.agent_mcp.stream_bridge import ExpertStreamService
@@ -21,9 +23,6 @@ router = APIRouter()
 MCP_SESSION_HEADER = "mcp-session-id"
 MCP_PROTOCOL_HEADER = "mcp-protocol-version"
 
-# 这几个是 /stream 的核心参数，不能被当成 caller_meta 透传。
-_STREAM_RESERVED_KEYS = frozenset({"expert_id", "message", "thread_id"})
-
 
 def _service(server: Any) -> AgentMcpGatewayService:
     if server.app_runtime is None:
@@ -31,6 +30,7 @@ def _service(server: Any) -> AgentMcpGatewayService:
     return AgentMcpGatewayService(
         agent_manager=server.app_runtime.agent_registry,
         gateway=server.app_runtime.gateway,
+        artifact_sink=ArtifactSink.from_config(server.config),
     )
 
 
@@ -40,6 +40,7 @@ def _stream_service(server: Any) -> ExpertStreamService:
     return ExpertStreamService(
         agent_manager=server.app_runtime.agent_registry,
         gateway=server.app_runtime.gateway,
+        artifact_sink=ArtifactSink.from_config(server.config),
     )
 
 
@@ -114,15 +115,31 @@ async def agent_mcp_stream(
     user: Any = Depends(current_user),
     server: Any = Depends(get_server),
 ) -> Response:
-    """正文流式 + 工具状态（只到 start/end 粒度）+ 不含思考过程。
+    """正文流式 + 工具状态（只到 start/end 粒度）+ 产物 + 不含思考过程。
 
     请求体：
         {
           "expert_id": "xxx",            # 必填
-          "message": "……",               # 必填
+          "message": "……",               # 与 attachments 不可同时为空
           "thread_id": "xxx",            # 可选，续聊时带上一轮 ack/done 里的值
+          "attachments": [               # 可选，最多 8 条
+            {"path": "inbound/1700000000_chart.png",
+             "mime_type": "image/png", "filename": "chart.png"}
+          ],
           "itr_user_id": 1997            # 其余字段按白名单透传进 turn metadata
         }
+
+    ``attachments[].path`` 必须是先经 ``POST /api/agents/{agent_id}/upload``
+    上传后得到的 workspace 相对路径，且必须位于 ``inbound/`` 下；图片进入视觉
+    输入（前 4 张，单图超 2MB 降级为路径提示），其他文件以路径提示交给模型。
+    路径越权或格式非法在开流前返回 4xx。
+
+    事件：``ack`` / ``token`` / ``tool`` / ``artifact`` / ``heartbeat`` /
+    ``hitl`` / ``error`` / ``done``。``artifact`` 字段与 dashboard 的附件帧一致
+    （``kind`` / ``url`` / ``preview_url`` / ``filename`` / ``mime_type`` / ``path``），
+    ``url`` 默认是相对路径且需登录态取字节；配置 ``OCTOP_ARTIFACT_SINK_URL``
+    后改为下游平台返回的绝对地址，原始地址保留在 ``octop_url``。
+    ``done.artifacts`` 汇总本轮全部产物，与逐帧推送内容一致。
     """
     try:
         body = await request.json()
@@ -137,12 +154,14 @@ async def agent_mcp_stream(
 
     raw_thread = body.get("thread_id")
     thread_id = str(raw_thread).strip() if raw_thread else None
+    # 附件在开流前校验（路径必须落在 inbound/ 下），一旦返回 200 就无法再改状态码
+    attachments = body.get("attachments")
 
     # 除核心参数外，其余非空字段按白名单透传（防提权在 _merge_caller_meta 里）。
     caller_meta = {
         key: value
         for key, value in body.items()
-        if key not in _STREAM_RESERVED_KEYS and value is not None
+        if key not in TURN_RESERVED_ARGS and value is not None
     }
 
     service = _stream_service(server)
@@ -156,6 +175,7 @@ async def agent_mcp_stream(
             message=body.get("message"),
             thread_id=thread_id,
             caller_meta=caller_meta,
+            attachments=attachments,
         )
     except ValueError as exc:
         raise OctopError(ErrorCode.SLASH_BAD_ARGS, str(exc)) from exc
