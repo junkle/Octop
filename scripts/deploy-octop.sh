@@ -123,10 +123,12 @@ fi
 ok "安装完成（升级前: ${REMOTE_VER_BEFORE:-未知}）"
 
 # ── 阶段 4: 验证 ────────────────────────────────────────────────────────────
-info "阶段 4/4: 健康验证（等待 8089 就绪，最多 90s）"
+# 等待窗口 300s：新装依赖首次启动需全量编译 .pyc（99 实测 tencentcloud-sdk 等达 3m27s，
+# 二次启动回落到 ~32s），90s 窗口会误报失败。
+info "阶段 4/4: 健康验证（等待 8089 就绪，最多 300s）"
 verify() {  # $1 = 远程验证命令前缀（直接 ssh 即可执行的 shell 片段）
   local i
-  for i in $(seq 1 18); do
+  for i in $(seq 1 60); do
     sleep 5
     if ssh "$HOST" 'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8089/' 2>/dev/null | grep -q 200; then
       return 0
@@ -139,7 +141,7 @@ verify() {  # $1 = 远程验证命令前缀（直接 ssh 即可执行的 shell �
 if verify; then
   ok "8089 首页 HTTP 200"
 else
-  fail "8089 未在 90s 内就绪，请查日志：journalctl ${TARGET:+} -u octop"
+  fail "8089 未在 300s 内就绪，请查日志：journalctl ${TARGET:+} -u octop"
 fi
 
 if [[ "$TARGET" == "test" ]]; then
