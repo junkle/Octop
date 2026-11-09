@@ -79,6 +79,7 @@ import {
   ensureBwrapMessage,
   ensureBwrapToastKind,
   parseBackendSpec,
+  preserveBackendRuntime,
   probeRootDir,
   rootDirProbeMessage,
   shouldProbeRootDir,
@@ -448,11 +449,14 @@ function EditAgentDrawerBody({
         }
       }
 
-      const backendSpec = buildBackendSpec(
-        values.backend_choice,
-        values.composite_default ?? DEFAULT_BACKEND,
-        pathMappings,
-        values.root_dir,
+      const backendSpec = preserveBackendRuntime(
+        agentConfig.backend,
+        buildBackendSpec(
+          values.backend_choice,
+          values.composite_default ?? DEFAULT_BACKEND,
+          pathMappings,
+          values.root_dir,
+        ),
       );
 
       const nextColor = isCuratedPalette(colorPalette)

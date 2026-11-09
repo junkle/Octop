@@ -116,3 +116,9 @@ scripts/lh_image_install_octop_tencentos.sh
 .worktrees/
 # Local conda environment
 .conda-octop/
+
+# WorkBuddy agent memory (local only)
+.workbuddy/
+
+# Local pip download cache
+pip/
