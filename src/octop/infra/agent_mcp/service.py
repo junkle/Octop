@@ -36,6 +36,26 @@ MCP_CHANNEL_ID = "octop-agent-mcp"
 _MAX_DECISIONS = 16
 _MAX_DECISION_MESSAGE_CHARS = 100_000
 _DECISION_TYPES = frozenset({"approve", "edit", "reject", "respond"})
+# call_octop_expert 额外参数中允许透传进 turn metadata 的调用方身份 key。
+# 保留字段（session_key/thread_id/user_is_admin）一律不允许被外部调用方覆盖。
+_CALLER_META_ALLOWED_KEYS = frozenset(
+    {"itr_user_id", "itr_nickname", "wecom_user_id", "business_context"}
+)
+
+
+def _merge_caller_meta(
+    meta: dict[str, Any], caller_meta: dict[str, Any] | None
+) -> None:
+    """把外部调用方声明的身份合并进 turn metadata（仅白名单 key）。
+
+    保留字段（user_is_admin / session_key / thread_id 等）由服务端自行填充，
+    外部调用方传入的同名参数会被忽略，防止提权。
+    """
+    if not caller_meta:
+        return
+    for key, value in caller_meta.items():
+        if key in _CALLER_META_ALLOWED_KEYS and value is not None:
+            meta[key] = value
 
 
 class AgentMcpGatewayService:
@@ -96,8 +116,7 @@ class AgentMcpGatewayService:
         }
         # 外部 Agent（如 ITR）经 arguments 声明的调用方身份，随 metadata 透传，
         # 供专家在本轮 turn 调用上游 MCP 工具时做数据权限过滤。
-        if caller_meta:
-            meta.update({k: v for k, v in caller_meta.items() if v is not None})
+        _merge_caller_meta(meta, caller_meta)
         inbound = self._build_inbound(
             row=row,
             user=user,
@@ -249,9 +268,15 @@ class AgentMcpGatewayService:
             raise OctopError(ErrorCode.AGENT_NOT_RUNNING, "expert is disabled")
         return row
 
-    @staticmethod
-    def _can_access(row: Any, user: User) -> bool:
-        return bool(user.is_admin or row.user_id == user.id or row.is_shared)
+    def _can_access(self, row: Any, user: User) -> bool:
+        from octop.infra.users.groups import expert_visible_to  # noqa: PLC0415
+
+        return expert_visible_to(
+            self._agent_manager._repos,
+            row,
+            user_id=user.id,
+            is_admin=bool(user.is_admin),
+        )
 
     def _build_inbound(
         self,

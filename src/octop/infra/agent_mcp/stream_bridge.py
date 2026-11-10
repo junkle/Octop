@@ -21,7 +21,7 @@ from typing import Any
 from octop_gateway.models import InboundMessage
 
 from octop.infra.agent_mcp.attachments import validate_attachments, validate_turn
-from octop.infra.agent_mcp.service import AgentMcpGatewayService
+from octop.infra.agent_mcp.service import AgentMcpGatewayService, _merge_caller_meta
 from octop.infra.gateway.hitl.coordinator import HitlStreamContext
 from octop.infra.gateway.hitl.format import normalize_hitl_request
 from octop.infra.gateway.threads import ThreadRegistry
@@ -30,20 +30,6 @@ _log = logging.getLogger(__name__)
 
 # 心跳间隔。反代/网关的空闲超时一般是 60s，留出 4 倍余量。
 HEARTBEAT_SECONDS = 15.0
-
-# ITR 已用字段白名单；禁止覆盖 session_key / thread_id / user_is_admin（防提权）。
-# 本地 service 无 _merge_caller_meta，故写在本模块内。
-_ALLOWED_CALLER_META = frozenset(
-    {"itr_user_id", "itr_nickname", "wecom_user_id", "business_context"}
-)
-
-
-def _merge_caller_meta(meta: dict[str, Any], caller_meta: dict[str, Any] | None) -> None:
-    if not caller_meta:
-        return
-    for key, value in caller_meta.items():
-        if key in _ALLOWED_CALLER_META and value is not None:
-            meta[key] = value
 
 
 def sse_frame(event: str, data: dict[str, Any]) -> str:

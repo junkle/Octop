@@ -196,6 +196,7 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_CAPTCHA_V3_MIN_SCORE` | float | `0.5` | Minimum `recaptcha-v3` score; admin UI is read-only |
 | `OCTOP_DEFAULT_TIMEZONE` | IANA tz | `Asia/Shanghai` | Default timezone for display, scheduling, and harness (`cron_timezone` / `OCTOP_CRON_TIMEZONE` still accepted) |
 | `OCTOP_CORS_ORIGINS` | comma-sep list | empty | Permitted CORS origins for the dashboard / external callers |
+| `OCTOP_MCP_HTTP_ALLOWED_HOSTS` | comma-sep list | empty | Hosts allowed to use HTTP for custom MCP/connector URLs. Entries may be exact hosts (`finder.example.com`) or suffixes (`*.example.com`); loopback/LAN hosts remain allowed without this setting |
 | `OCTOP_ENABLE_DASHBOARD` | bool | `true` | Serve the built React SPA at `/` |
 | `OCTOP_ENABLE_API_DOCS` | bool | `false` | Expose Scalar API docs at `/api/docs` |
 | `OCTOP_REQUIRE_SETUP_PASSWORD` | bool | `true` | Require wizard password during initial setup |
@@ -218,6 +219,10 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_AGENT` | string | empty | Default `--agent` for CLI subcommands |
 | `OCTOP_SERVICE_MODE` | `systemd` \| `launchd` | auto | Override the service backend (used by `octop service`) |
 | `OCTOP_SERVICE_SCOPE` | `user` \| `system` | auto | systemd `--user` vs system unit (Linux only) |
+| `OCTOP_PORTAL_ORIGIN` | origin | `https://octop.cloud` | Plugin and expert catalog origin. No path. Empty disables the remote catalog. See [private market](private-market.md) |
+| `OCTOP_MARKET_REMOTE_ORIGIN` | origin | `https://download.octop.cloud` | Origin allowed for market archive `download_url` values. Any path on that origin is accepted. The variable itself has no path. See [private market](private-market.md) |
+| `SKILL_MARKET_ORIGIN` | origin | `https://api.skillhub.cn` | Skill search, rankings, and per-skill zip download. No path. Empty keeps the default. See [skill market](skill-market.md) |
+| `SKILLSET_ORIGIN` | origin | `https://api.skillhub.cn` | Skillset detail and skillset package used when importing a skill package. No path. Empty keeps the default. See [skill market](skill-market.md) |
 
 Invalid integer values are logged and ignored — the on-disk default
 remains in effect. `database_env_configured()` returns `True` when any
@@ -228,6 +233,16 @@ configured backend at boot.
 they are listed under `environment:` in `docker/docker-compose.yml`
 (Compose uses `.env` for interpolation only; unset keys do not enter the
 container). Writing the same keys to the mounted `~/.octop/env` also works.
+
+When `database.driver` is `postgresql`, skill-package sources and knowledge-base
+originals are stored in that same database (`public.skill_package_files` and
+`public.knowledge_files`), and knowledge vectors use pgvector
+(`public.knowledge_chunks`). Names sit next to `skill_packages` and
+`knowledge_bases`. SQLite keeps the local `skill-packages/` and
+`knowledge/` directories. The `vector` extension is not created by Octop
+migrations; enable it with `docker/postgres/init-vector.sql` or
+`CREATE EXTENSION vector` before indexing knowledge. There is no sqlite→PostgreSQL
+content migration in this release — pick the driver at install time.
 
 ### Agent memory vs control plane
 

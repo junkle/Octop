@@ -294,6 +294,57 @@ export function buildBackendSpec(
   return backendRefToSpec(choice, rootDir);
 }
 
+export function preserveBackendRuntime(
+  existing: unknown,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
+    return next;
+  }
+  const previous = existing as Record<string, unknown>;
+  if (next.type === "composite") {
+    if (previous.type !== "composite") return next;
+    const result = { ...next };
+    if (
+      result.default &&
+      typeof result.default === "object" &&
+      !Array.isArray(result.default)
+    ) {
+      result.default = preserveBackendRuntime(
+        previous.default,
+        result.default as Record<string, unknown>,
+      );
+    }
+    if (
+      result.routes &&
+      typeof result.routes === "object" &&
+      !Array.isArray(result.routes) &&
+      previous.routes &&
+      typeof previous.routes === "object" &&
+      !Array.isArray(previous.routes)
+    ) {
+      const routes = { ...(result.routes as Record<string, unknown>) };
+      const previousRoutes = previous.routes as Record<string, unknown>;
+      for (const [path, route] of Object.entries(routes)) {
+        if (route && typeof route === "object" && !Array.isArray(route)) {
+          routes[path] = preserveBackendRuntime(
+            previousRoutes[path],
+            route as Record<string, unknown>,
+          );
+        }
+      }
+      result.routes = routes;
+    }
+    return result;
+  }
+  if (previous.type !== next.type) return next;
+  const runtime: Record<string, unknown> = {};
+  for (const key of ["inherit_env", "env"] as const) {
+    if (key in previous) runtime[key] = previous[key];
+  }
+  return { ...runtime, ...next };
+}
+
 function specToBackendRef(spec: Record<string, unknown>): string {
   const type = String(spec.type ?? "");
   if (type === "named") {
