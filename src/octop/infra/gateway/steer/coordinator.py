@@ -169,8 +169,17 @@ class SteerCoordinator:
             state = self._by_thread.get(thread_id.strip())
             if state is None:
                 return
-            if state.phase != phase:
-                state.phase = phase
+            # Always refresh: repeated transitions to the same phase (e.g. a
+            # tool_result every few seconds keeps the turn in awaiting_tools)
+            # are activity evidence for the stuck-TTL sweep.
+            state.phase = phase
+            state.phase_changed_at = time.time()
+
+    def touch(self, thread_id: str) -> None:
+        """Mark in-flight activity (any harness chunk) for the stuck-TTL."""
+        with self._lock:
+            state = self._by_thread.get(thread_id.strip())
+            if state is not None:
                 state.phase_changed_at = time.time()
 
     def get_state(self, thread_id: str) -> TurnSteerState | None:
@@ -443,26 +452,26 @@ class SteerCoordinator:
                 # turn instead of queueing behind a corpse.
                 logger.warning(
                     "steer admit sweeps stuck turn thread=%s turn_id=%s phase=%s "
-                    "idle_for=%.0fs queued=%d",
+                    "stale_for=%.0fs queued=%d",
                     thread_id,
                     state.turn_id,
                     state.phase,
                     time.time() - state.phase_changed_at,
                     len(state.queue),
                 )
-                bundle = self._discard_locked(state, reason="turn_cancelled") if state.queue else None
+                if state.queue:
+                    # Queued steers die with the corpse turn; the client will
+                    # not see a steer.discarded frame from this sync path, but
+                    # its pending bubbles clear on the next thread snapshot.
+                    self._discard_locked(state, reason="turn_cancelled")
                 self._remember_ended_turn(thread_id.strip(), state.turn_id, state.user_id)
                 self._by_thread.pop(thread_id.strip(), None)
                 state = None
-                if bundle is not None:
-                    # Caller cannot push frames from this sync path; the queue
-                    # contents are already discarded above so the next turn is
-                    # clean even if the client never sees a steer.discarded.
-                    pass
             active = (
                 state is not None
                 and state.phase not in ("idle", "terminal")
                 and not self._park_expired(state)
+                and not self._stuck_expired(state)
             )
 
             if delivery == "follow_up" and active:

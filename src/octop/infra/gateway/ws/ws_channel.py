@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from typing import Any
@@ -30,9 +31,16 @@ from octop.infra.gateway.process.message_keys import (
     resolve_user_id_for_message,
 )
 from octop.infra.gateway.steer import DiscardBundle, DrainBundle, SteerCoordinator
+from octop.infra.gateway.steer.types import STUCK_TURN_TTL_SECONDS
 from octop.infra.gateway.threads import ThreadRegistry
 from octop.infra.gateway.ws.ws_hub import WebSocketHub
 from octop.infra.utils.locale import resolve_locale
+
+# Wall-clock cap a WS turn loop waits for a single harness chunk. Generous:
+# real tool calls stream tool_call_chunk / token frames continuously, so only
+# a truly hung stream (dead MCP call) ever reaches it. After the timeout the
+# loop cancels the agent stream and fails the turn so end_turn runs.
+_STUCK_STREAM_TIMEOUT_S = STUCK_TURN_TTL_SECONDS + 60
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +200,30 @@ class WebSocketChannel(BaseChannel):
                 saw_tool_result = False
                 preempted = False
                 stream = processor.iter_turn_chunks(current)
-                async for chunk in stream:
+                # Stuck-stream watchdog: a hung tool call blocks inside the
+                # harness stream and this loop never wakes. Wrap __anext__ with
+                # a generous timeout so the corpse loop exits, end_turn finally
+                # runs, and the thread returns to idle (issue #3137).
+                stream_iter = stream.__aiter__()
+                while True:
+                    try:
+                        async with asyncio.timeout(_STUCK_STREAM_TIMEOUT_S):
+                            chunk = await stream_iter.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError:
+                        logger.warning(
+                            "ws turn stream hung %ss without a chunk; abandoning "
+                            "thread=%s agent=%s",
+                            _STUCK_STREAM_TIMEOUT_S,
+                            thread_id,
+                            message.tenant_id,
+                        )
+                        cancel = getattr(processor, "cancel_agent_stream", None)
+                        if callable(cancel):
+                            cancel(str(message.tenant_id or ""), thread_id)
+                        failed = True
+                        break
                     chunk_type = str(chunk.get("type") or "") if isinstance(chunk, dict) else ""
                     if preempted and chunk_type not in ("done", "error"):
                         # Cancel already landed at the tool boundary. Later

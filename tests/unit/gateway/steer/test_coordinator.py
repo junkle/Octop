@@ -426,3 +426,22 @@ def test_live_turn_not_swept() -> None:
     result = c.admit("t1", text="steer me", client_pending_id="c1", expected_turn_id=turn_id)
     assert isinstance(result, SteerAdmitOk)
     assert "t1" in c._by_thread
+
+
+def test_repeated_phase_transitions_refresh_ttl() -> None:
+    """Long multi-tool turns stay alive: repeated same-phase transitions
+    (tool_result → awaiting_tools → tool_result → …) count as activity."""
+    c = SteerCoordinator()
+    c.begin_turn("t1")
+    c.set_phase("t1", "awaiting_tools")
+    state = c._by_thread["t1"]
+    old = state.phase_changed_at
+    # 9 minutes pass, another tool result lands, 9 more minutes pass — total
+    # 18min > TTL but the turn was never idle for 10 consecutive minutes.
+    state.phase_changed_at -= 9 * 60
+    c.set_phase("t1", "awaiting_tools")  # same phase, must still refresh
+    state.phase_changed_at -= 9 * 60
+    assert c.is_active("t1") is True  # only 9min since last activity
+    # ...but 10+ minutes of silence is a corpse
+    state.phase_changed_at -= 61
+    assert c.is_active("t1") is False
