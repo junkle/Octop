@@ -52,6 +52,11 @@ class TrajectoryService:
         self._bus = bus
         self._inflight: dict[str, _ThreadInFlight] = {}
         self._metrics_cache: dict[str, _CachedMetrics] = {}
+        self._fk_fails: dict[str, int] = {}
+
+    #: Consecutive FK failures per thread before the observer detaches (the
+    #: thread row is gone — a dead thread must not spam the log forever).
+    _FK_FAIL_DETACH_AFTER = 2
 
     def observe_chunk(self, agent_id: str, thread_id: str, chunk: dict[str, Any]) -> None:
         try:
@@ -67,13 +72,41 @@ class TrajectoryService:
                 else:
                     self._finalize_assistant(event.thread_id)
                     self._commit_new(event)
-        except Exception:
+            self._fk_fails.pop(thread_id, None)
+        except Exception as exc:
             self._store.record_failure(thread_id)
+            if self._is_missing_thread_error(exc) and self._detach_dead_thread(thread_id):
+                return
             logger.exception(
                 "trajectory observe_chunk failed agent=%s thread=%s",
                 agent_id,
                 thread_id,
             )
+
+    @staticmethod
+    def _is_missing_thread_error(exc: Exception) -> bool:
+        """FK violation on trajectory_events → the thread row no longer exists."""
+        name = type(exc).__name__
+        return name in ("ForeignKeyViolation", "IntegrityError") or "foreign key" in str(exc).lower()
+
+    def _detach_dead_thread(self, thread_id: str) -> bool:
+        """Count FK failures; after N in a row, drop in-flight state and detach.
+
+        Returns True when detached (caller skips the noisy exception log).
+        """
+        fails = self._fk_fails.get(thread_id, 0) + 1
+        if fails < self._FK_FAIL_DETACH_AFTER:
+            self._fk_fails[thread_id] = fails
+            return False
+        self._fk_fails.pop(thread_id, None)
+        self._inflight.pop(thread_id, None)
+        self._metrics_cache.pop(thread_id, None)
+        logger.warning(
+            "trajectory observer detached for deleted thread=%s after %d fk failures",
+            thread_id,
+            fails,
+        )
+        return True
 
     def record_failure(self, thread_id: str) -> None:
         """Record an uncommitted trajectory flush for the archive status."""

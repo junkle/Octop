@@ -332,3 +332,97 @@ def test_team_followup_keeps_other_senders_waiting() -> None:
     assert wrap == turn_id
     c.release_room_followup("room")
     assert c.blocks_other_sender("room", 2) is False
+
+
+def test_admit_sweeps_stuck_turn_after_ttl() -> None:
+    """A turn hung in a non-idle phase stops blocking after STUCK_TURN_TTL."""
+    from octop.infra.gateway.steer.types import STUCK_TURN_TTL_SECONDS
+
+    c = SteerCoordinator()
+    turn_id, _, _ = c.begin_turn("t1")
+    c.set_phase("t1", "awaiting_tools")
+    assert c.is_active("t1") is True
+    # While fresh, a new message steers into the live turn (not a fresh turn).
+    result = c.admit("t1", text="queued", client_pending_id="c1", expected_turn_id=turn_id)
+    assert isinstance(result, SteerAdmitOk)
+
+    # Simulate the hang: phase timestamp pushed past the TTL.
+    state = c._by_thread["t1"]
+    state.phase_changed_at -= STUCK_TURN_TTL_SECONDS + 1
+    assert c.is_active("t1") is False
+
+    # The next admission sweeps the corpse and lets a new turn start.
+    admitted = c.admit("t1", text="fresh", client_pending_id="c2", expected_turn_id=None)
+    assert admitted is None  # None → caller starts a normal new turn
+    assert "t1" not in c._by_thread
+
+
+def test_admit_cancelling_phase_short_grace() -> None:
+    """A `cancelling` phase unblocks after 60s even if the turn never ends."""
+    c = SteerCoordinator()
+    c.begin_turn("t1")
+    c.mark_cancelling("t1")
+    assert c.is_active("t1") is True
+
+    state = c._by_thread["t1"]
+    state.phase_changed_at -= 61
+    assert c.is_active("t1") is False
+    assert c.admit("t1", text="next", client_pending_id="c1", expected_turn_id=None) is None
+
+
+def test_live_turn_not_swept() -> None:
+    """A healthy turn that recently changed phase is never swept."""
+    c = SteerCoordinator()
+    turn_id, _, _ = c.begin_turn("t1")
+    c.set_phase("t1", "awaiting_tools")
+    assert c.is_active("t1") is True
+    result = c.admit("t1", text="steer me", client_pending_id="c1", expected_turn_id=turn_id)
+    assert isinstance(result, SteerAdmitOk)
+    assert "t1" in c._by_thread
+
+
+def test_admit_sweeps_stuck_turn_after_ttl() -> None:
+    """A turn hung in a non-idle phase stops blocking after STUCK_TURN_TTL."""
+    from octop.infra.gateway.steer.types import STUCK_TURN_TTL_SECONDS
+
+    c = SteerCoordinator()
+    turn_id, _, _ = c.begin_turn("t1")
+    c.set_phase("t1", "awaiting_tools")
+    assert c.is_active("t1") is True
+    # While fresh, a new message steers into the live turn (not a fresh turn).
+    result = c.admit("t1", text="queued", client_pending_id="c1", expected_turn_id=turn_id)
+    assert isinstance(result, SteerAdmitOk)
+
+    # Simulate the hang: phase timestamp pushed past the TTL.
+    state = c._by_thread["t1"]
+    state.phase_changed_at -= STUCK_TURN_TTL_SECONDS + 1
+    assert c.is_active("t1") is False
+
+    # The next admission sweeps the corpse and lets a new turn start.
+    admitted = c.admit("t1", text="fresh", client_pending_id="c2", expected_turn_id=None)
+    assert admitted is None  # None → caller starts a normal new turn
+    assert "t1" not in c._by_thread
+
+
+def test_admit_cancelling_phase_short_grace() -> None:
+    """A `cancelling` phase unblocks after 60s even if the turn never ends."""
+    c = SteerCoordinator()
+    c.begin_turn("t1")
+    c.mark_cancelling("t1")
+    assert c.is_active("t1") is True
+
+    state = c._by_thread["t1"]
+    state.phase_changed_at -= 61
+    assert c.is_active("t1") is False
+    assert c.admit("t1", text="next", client_pending_id="c1", expected_turn_id=None) is None
+
+
+def test_live_turn_not_swept() -> None:
+    """A healthy turn that recently changed phase is never swept."""
+    c = SteerCoordinator()
+    turn_id, _, _ = c.begin_turn("t1")
+    c.set_phase("t1", "awaiting_tools")
+    assert c.is_active("t1") is True
+    result = c.admit("t1", text="steer me", client_pending_id="c1", expected_turn_id=turn_id)
+    assert isinstance(result, SteerAdmitOk)
+    assert "t1" in c._by_thread

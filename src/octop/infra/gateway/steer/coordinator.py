@@ -23,6 +23,7 @@ from octop.infra.gateway.steer.types import (
     STEER_DEPTH_CAP,
     STEER_TEXT_CAP_BYTES,
     STEERABLE_PHASES,
+    STUCK_TURN_TTL_SECONDS,
     AdmitResult,
     Delivery,
     DiscardReason,
@@ -168,7 +169,9 @@ class SteerCoordinator:
             state = self._by_thread.get(thread_id.strip())
             if state is None:
                 return
-            state.phase = phase
+            if state.phase != phase:
+                state.phase = phase
+                state.phase_changed_at = time.time()
 
     def get_state(self, thread_id: str) -> TurnSteerState | None:
         with self._lock:
@@ -200,6 +203,7 @@ class SteerCoordinator:
                 state is not None
                 and state.phase not in ("idle", "terminal")
                 and not self._park_expired(state)
+                and not self._stuck_expired(state)
                 and _other_user(state.user_id, user_id)
             ):
                 return True
@@ -288,6 +292,7 @@ class SteerCoordinator:
                 state is not None
                 and state.phase not in ("idle", "terminal")
                 and not self._park_expired(state)
+                and not self._stuck_expired(state)
             )
 
     def has_pending(self, thread_id: str) -> bool:
@@ -352,6 +357,24 @@ class SteerCoordinator:
             and (time.time() - state.parked_at) > HITL_PARK_TTL_SECONDS
         )
 
+    @staticmethod
+    def _stuck_expired(state: TurnSteerState) -> bool:
+        """True when a non-idle turn outlived the stuck-TTL (hung tool call).
+
+        ``hitl_paused`` has its own park TTL; ``cancelling`` and every other
+        non-idle phase counts from the last phase transition. A healthy turn
+        transitions phases (streaming → awaiting_tools → …) far more often
+        than the TTL, so live turns are never swept — only corpses are.
+        """
+        if state.phase in ("idle", "terminal", "hitl_paused"):
+            return False
+        age = time.time() - state.phase_changed_at
+        if state.phase == "cancelling":
+            # Cancel already requested: shorten the grace so a cancel that
+            # never lands unblocks the thread quickly.
+            return age > min(STUCK_TURN_TTL_SECONDS, 60)
+        return age > STUCK_TURN_TTL_SECONDS
+
     def allocate_seq(self, thread_id: str) -> int:
         with self._lock:
             state = self._require(thread_id)
@@ -414,6 +437,28 @@ class SteerCoordinator:
         blocks = _normalize_blocks(content_blocks)
         with self._lock:
             state = self._by_thread.get(thread_id.strip())
+            if state is not None and self._stuck_expired(state):
+                # A turn hung mid-flight (dead tool call, lost cancel) blocks
+                # every later message. Sweep it so this message starts a fresh
+                # turn instead of queueing behind a corpse.
+                logger.warning(
+                    "steer admit sweeps stuck turn thread=%s turn_id=%s phase=%s "
+                    "idle_for=%.0fs queued=%d",
+                    thread_id,
+                    state.turn_id,
+                    state.phase,
+                    time.time() - state.phase_changed_at,
+                    len(state.queue),
+                )
+                bundle = self._discard_locked(state, reason="turn_cancelled") if state.queue else None
+                self._remember_ended_turn(thread_id.strip(), state.turn_id, state.user_id)
+                self._by_thread.pop(thread_id.strip(), None)
+                state = None
+                if bundle is not None:
+                    # Caller cannot push frames from this sync path; the queue
+                    # contents are already discarded above so the next turn is
+                    # clean even if the client never sees a steer.discarded.
+                    pass
             active = (
                 state is not None
                 and state.phase not in ("idle", "terminal")

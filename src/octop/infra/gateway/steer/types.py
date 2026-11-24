@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Literal
 
 STEER_DEPTH_CAP = 8
@@ -13,6 +14,10 @@ STEER_PREVIEW_CHARS = 200
 # Steers parked across an HITL pause are dropped if the approval is never
 # resolved (mirrors the HITL pending-store TTL horizon).
 HITL_PARK_TTL_SECONDS = 30 * 60
+# A turn stuck in a non-idle phase (hung tool call, lost cancel) blocks every
+# later message on the thread. Admissions older than this TTL sweep the stale
+# state so the next message starts a fresh turn instead of queueing forever.
+STUCK_TURN_TTL_SECONDS = 10 * 60
 
 TurnPhase = Literal[
     "streaming_text",
@@ -88,6 +93,9 @@ class TurnSteerState:
     last_allocated_seq: int = 0
     # Wall-clock epoch seconds when an HITL pause parked this state.
     parked_at: float | None = None
+    # Wall-clock epoch seconds of the last phase transition; a non-idle state
+    # older than STUCK_TURN_TTL_SECONDS is treated as a hung turn.
+    phase_changed_at: float = field(default_factory=time.time)
     # Model / skills / knowledge bases to reuse when a parked steer resumes.
     continuation_meta: dict[str, Any] = field(default_factory=dict)
 
