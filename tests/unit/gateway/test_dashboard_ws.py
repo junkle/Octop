@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from collections.abc import AsyncIterator
@@ -1176,3 +1177,93 @@ async def test_ws_channel_pure_text_stream_is_never_preempted() -> None:
     types = [f["type"] for f in frames]
     assert "steer.drained" in types
     assert types[-1] == "turn.ended"
+
+
+@pytest.mark.asyncio
+async def test_ws_channel_watchdog_fails_turn_on_hung_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stream that never yields a chunk must not keep the turn alive forever.
+
+    Regression for issue TencentCloud/Octop#3137: the WS loop blocked inside
+    async-for on a hung harness stream (dead MCP tool call) and end_turn never
+    ran — the thread stayed blocked for every later message.
+    """
+    import octop.infra.gateway.ws.ws_channel as ws_channel_mod
+    from octop.infra.gateway.steer import SteerCoordinator
+
+    # Shrink the watchdog to something test-friendly.
+    monkeypatch.setattr(ws_channel_mod, "_STUCK_STREAM_TIMEOUT_S", 0.2)
+
+    hub = WebSocketHub()
+    frames: list[dict[str, Any]] = []
+
+    async def capture(frame: dict[str, Any]) -> None:
+        frames.append(frame)
+
+    steer = SteerCoordinator()
+
+    class _HungProcessor:
+        def __init__(self) -> None:
+            self.cancel_calls: list[tuple[str, str]] = []
+
+        def cancel_agent_stream(self, agent_id: str, thread_id: str) -> None:
+            self.cancel_calls.append((agent_id, thread_id))
+
+        async def iter_turn_chunks(self, msg: InboundMessage) -> AsyncIterator[dict[str, Any]]:
+            yield {"type": "token", "content": "starting"}
+            # ... then the tool call hangs forever: no further chunk, no done.
+            await asyncio.Event().wait()
+
+    processor = _HungProcessor()
+    channel = WebSocketChannel(processor, hub=hub, steer=steer)  # type: ignore[arg-type]
+    hub.register("conn-1", capture)
+    await channel.handle_inbound(_steer_inbound("hang me"))
+
+    # The watchdog cancelled the agent stream ...
+    assert processor.cancel_calls == [("agent-1", "thread-1")]
+    # ... the turn failed and closed (turn.ended pushed, hub back to idle) ...
+    types = [f["type"] for f in frames]
+    assert types[-1] == "turn.ended"
+    assert hub.is_turn_active("thread-1") is False
+    # ... and steer no longer treats the thread as an active turn.
+    assert steer.is_active("thread-1") is False
+
+
+@pytest.mark.asyncio
+async def test_ws_channel_watchdog_stays_quiet_on_healthy_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that keeps yielding chunks within the budget is never killed."""
+    import octop.infra.gateway.ws.ws_channel as ws_channel_mod
+    from octop.infra.gateway.steer import SteerCoordinator
+
+    # Long enough budget that a fast fake stream never trips it.
+    monkeypatch.setattr(ws_channel_mod, "_STUCK_STREAM_TIMEOUT_S", 30)
+
+    hub = WebSocketHub()
+    frames: list[dict[str, Any]] = []
+
+    async def capture(frame: dict[str, Any]) -> None:
+        frames.append(frame)
+
+    class _HealthyProcessor:
+        def __init__(self) -> None:
+            self.cancel_calls: list[tuple[str, str]] = []
+
+        def cancel_agent_stream(self, agent_id: str, thread_id: str) -> None:
+            self.cancel_calls.append((agent_id, thread_id))
+
+        async def iter_turn_chunks(self, msg: InboundMessage) -> AsyncIterator[dict[str, Any]]:
+            for i in range(5):
+                yield {"type": "token", "content": f"chunk-{i}"}
+            yield {"type": "done"}
+
+    processor = _HealthyProcessor()
+    steer = SteerCoordinator()
+    channel = WebSocketChannel(processor, hub=hub, steer=steer)  # type: ignore[arg-type]
+    hub.register("conn-1", capture)
+    await channel.handle_inbound(_steer_inbound("healthy run"))
+
+    assert processor.cancel_calls == []  # never cancelled
+    types = [f["type"] for f in frames]
+    assert types[-1] == "turn.ended"
+    assert hub.is_turn_active("thread-1") is False
