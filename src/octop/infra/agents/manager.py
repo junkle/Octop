@@ -4763,6 +4763,16 @@ class AgentManager:
         harness_fields: dict[str, Any] = {}
         if "decision" in _HARNESS_AGENT_CONFIG_FIELDS:
             harness_fields["decision"] = self._decision.harness_config()
+        # Agent-level MCP tool deferral: with heavy MCP servers (hundreds of
+        # tool schemas) eager injection bloats every prompt and slows first
+        # tokens drastically. ``"mcp_tool_defer": true`` in the agent config
+        # section routes MCP tools through the harness ToolSearchMiddleware
+        # (name+description only; the model pulls schemas on demand).
+        if "defer_mcp_tools" in _HARNESS_AGENT_CONFIG_FIELDS and cfg.get("mcp_tool_defer") is True:
+            harness_fields["defer_mcp_tools"] = True
+            if "tool_search_mode" in _HARNESS_AGENT_CONFIG_FIELDS:
+                mode = cfg.get("mcp_tool_search_mode")
+                harness_fields["tool_search_mode"] = mode if mode in ("client", "native") else "client"
 
         harness_cfg = HarnessAgentConfig(
             name=_memory_namespace(row.agent_id),

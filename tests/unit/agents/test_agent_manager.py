@@ -3289,3 +3289,29 @@ async def test_restore_respects_runtime_capability_and_expert_scope(
     finally:
         for row in rows:
             await manager.stop(row.agent_id)
+
+
+def test_mcp_tool_defer_reaches_harness_config(manager: AgentManager) -> None:
+    """``"mcp_tool_defer": true`` in the agent config enables ToolSearch deferral."""
+    from dataclasses import fields
+
+    from octop_harness.config import HarnessAgentConfig
+
+    if "defer_mcp_tools" not in {f.name for f in fields(HarnessAgentConfig)}:
+        pytest.skip("installed harness does not support defer_mcp_tools")
+    cfg = manager._build_harness_config(_row(config_json=json.dumps({"mcp_tool_defer": True})))
+    assert cfg.defer_mcp_tools is True
+    assert cfg.tool_search_mode == "client"
+
+
+def test_mcp_tool_defer_explicit_mode(manager: AgentManager) -> None:
+    cfg = manager._build_harness_config(
+        _row(config_json=json.dumps({"mcp_tool_defer": True, "mcp_tool_search_mode": "native"}))
+    )
+    assert cfg.tool_search_mode == "native"
+
+
+def test_mcp_tool_defer_default_off(manager: AgentManager) -> None:
+    """Without the flag every MCP tool schema stays eagerly injected."""
+    cfg = manager._build_harness_config(_row(config_json=json.dumps({})))
+    assert cfg.defer_mcp_tools is False
