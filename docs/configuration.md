@@ -204,6 +204,8 @@ Each variable, when set, takes precedence over the matching key in
 | `OCTOP_ARTIFACT_SINK_URL` | string | empty | Multipart endpoint that receives MCP artifacts before emission; empty disables delivery |
 | `OCTOP_ARTIFACT_SINK_TOKEN` | string | empty | Bearer token for the sink endpoint; never logged and never written to `config.json` |
 | `OCTOP_ARTIFACT_SINK_TIMEOUT_SECONDS` | int | `15` | Per-upload timeout for artifact delivery |
+| `OCTOP_SSRF_ALLOWLIST` | comma-sep list | empty | Outbound targets that may be private / LAN addresses for voice providers, OAuth MCP discovery and token calls, and other guarded probes: host names (`whisper.corp`), `.suffix` domains (`.lan`) or CIDRs (`192.168.1.0/24`). Targets are still resolved and pinned to the checked IP. Listing a name trusts its DNS answers. Empty keeps the default public-https-only policy |
+| `OCTOP_SSRF_ALLOW_HTTP` | bool | `false` | Let targets in `OCTOP_SSRF_ALLOWLIST` use plain `http`; everything else stays https-only |
 | `OCTOP_DATABASE_URL` | string | empty | Full DSN — overrides the `OCTOP_DATABASE_*` fields below |
 | `OCTOP_DATABASE_DRIVER` | `sqlite` \| `postgresql` | `sqlite` | Storage backend |
 | `OCTOP_DATABASE_SQLITE_PATH` | path | `octop.db` | SQLite file path (relative to `OCTOP_HOME` unless absolute) |
